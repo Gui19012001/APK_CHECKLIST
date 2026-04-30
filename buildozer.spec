@@ -5,11 +5,11 @@ package.domain = br.com.suaempresa
 
 source.dir = .
 source.include_exts = py,kv,png,jpg,jpeg,json,txt,env,pdf
-source.exclude_dirs = .git,.github,__pycache__,bin,.buildozer,venv
+source.exclude_dirs = .git,.github,__pycache__,bin,.buildozer,venv,.venv
 
 version = 0.1.0
 
-requirements = python3,kivy,requests,tzdata,pillow,reportlab
+requirements = python3,kivy,requests,tzdata,pillow,reportlab,urllib3,chardet,idna,certifi
 
 orientation = portrait
 fullscreen = 0
@@ -17,8 +17,11 @@ fullscreen = 0
 android.permissions = INTERNET,CAMERA,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE
 android.api = 34
 android.minapi = 24
-android.archs = arm64-v8a, armeabi-v7a
+android.ndk = 25b
+android.archs = arm64-v8a,armeabi-v7a
 android.accept_sdk_license = True
+
+p4a.branch = master
 
 [buildozer]
 log_level = 2
