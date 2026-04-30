@@ -9,7 +9,7 @@ source.exclude_dirs = .git,.github,__pycache__,bin,.buildozer,venv
 
 version = 0.1.0
 
-requirements = python3,kivy,requests,tzdata,pillow,reportlab,opencv-python
+requirements = python3,kivy,requests,tzdata,pillow,reportlab
 
 orientation = portrait
 fullscreen = 0
