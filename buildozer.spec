@@ -9,7 +9,7 @@ source.exclude_dirs = .git,.github,__pycache__,bin,.buildozer,venv,.venv
 
 version = 0.1.0
 
-requirements = python3,kivy,requests,tzdata,pillow,reportlab,urllib3,chardet,idna,certifi
+requirements = python3,kivy,requests,tzdata,pillow,fpdf2,urllib3,chardet,idna,certifi
 
 orientation = portrait
 fullscreen = 0
@@ -18,7 +18,7 @@ android.permissions = INTERNET,CAMERA,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORA
 android.api = 34
 android.minapi = 24
 android.ndk = 25b
-android.archs = arm64-v8a,armeabi-v7a
+android.archs = arm64-v8a
 android.accept_sdk_license = True
 
 p4a.branch = master
