@@ -196,6 +196,17 @@ def pasta_base_documentos():
             return base
         except Exception:
             pass
+
+    # Android: tenta usar pasta pública Documents/Checklists.
+    # Se o Android bloquear gravação por permissão/scoped storage, usa pasta privada do app.
+    try:
+        from android.storage import primary_external_storage_path
+        base = Path(primary_external_storage_path()) / "Documents" / "Checklists"
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+    except Exception:
+        pass
+
     base = Path(getattr(app, "user_data_dir", str(BASE_DIR))) / "checklists_fotos"
     base.mkdir(parents=True, exist_ok=True)
     return base
@@ -310,23 +321,114 @@ def _pdf_multicell_row(pdf, cols, widths, line_h=5):
     pdf.set_xy(x0, y0 + row_h)
 
 
-def gerar_pdf_checklist_local(item_apontamento, respostas, complementos, usuario, foto_path=""):
-    """
-    Gera um PDF local na mesma pasta da foto usando FPDF2.
-
-    Requer no buildozer.spec:
-    requirements = python3,kivy,requests,tzdata,pillow,fpdf2,urllib3,chardet,idna,certifi
-
-    IMPORTANTE: esta versão remove ReportLab para evitar erro de compilação no Buildozer.
-    """
+def _safe_import_pillow():
     try:
-        from fpdf import FPDF
+        from PIL import Image, ImageDraw, ImageFont, ImageOps
+        return Image, ImageDraw, ImageFont, ImageOps
     except Exception as e:
         raise RuntimeError(
-            "Biblioteca fpdf2 não encontrada. Instale com: pip install fpdf2 "
-            "e adicione fpdf2 no requirements do buildozer.spec. "
+            "Biblioteca Pillow não encontrada. Adicione pillow no requirements do buildozer.spec. "
             f"Erro original: {e}"
         )
+
+
+def _font_default(size=18, bold=False):
+    """
+    Usa fonte padrão do Pillow para evitar dependência de fontes externas no Android.
+    Mantém o PDF funcional sem reportlab/fpdf2/fontTools.
+    """
+    Image, ImageDraw, ImageFont, ImageOps = _safe_import_pillow()
+    candidatos = []
+    if os.name == "nt":
+        candidatos += [
+            "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+            "C:/Windows/Fonts/calibrib.ttf" if bold else "C:/Windows/Fonts/calibri.ttf",
+        ]
+    candidatos += [
+        "/system/fonts/Roboto-Bold.ttf" if bold else "/system/fonts/Roboto-Regular.ttf",
+        "/system/fonts/DroidSans-Bold.ttf" if bold else "/system/fonts/DroidSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for caminho in candidatos:
+        try:
+            if caminho and Path(caminho).exists():
+                return ImageFont.truetype(caminho, size=size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+def _draw_text_box(draw, xy, text, font, fill=(17, 24, 39), max_width=600, line_spacing=4):
+    """Desenha texto com quebra automática. Retorna a próxima posição Y."""
+    x, y = xy
+    text = _limpar_texto_pdf(text)
+    words = text.split()
+    lines = []
+    atual = ""
+    for word in words:
+        teste = (atual + " " + word).strip()
+        try:
+            largura = draw.textbbox((0, 0), teste, font=font)[2]
+        except Exception:
+            largura = len(teste) * 8
+        if largura <= max_width or not atual:
+            atual = teste
+        else:
+            lines.append(atual)
+            atual = word
+    if atual:
+        lines.append(atual)
+    if not lines:
+        lines = [""]
+    for line in lines:
+        draw.text((x, y), line, font=font, fill=fill)
+        try:
+            h = draw.textbbox((x, y), line, font=font)[3] - draw.textbbox((x, y), line, font=font)[1]
+        except Exception:
+            h = 16
+        y += h + line_spacing
+    return y
+
+
+def _medir_texto_quebrado(draw, text, font, max_width, line_spacing=4):
+    text = _limpar_texto_pdf(text)
+    words = text.split()
+    lines = []
+    atual = ""
+    for word in words:
+        teste = (atual + " " + word).strip()
+        try:
+            largura = draw.textbbox((0, 0), teste, font=font)[2]
+        except Exception:
+            largura = len(teste) * 8
+        if largura <= max_width or not atual:
+            atual = teste
+        else:
+            lines.append(atual)
+            atual = word
+    if atual:
+        lines.append(atual)
+    if not lines:
+        lines = [""]
+    altura = 0
+    for line in lines:
+        try:
+            bbox = draw.textbbox((0, 0), line, font=font)
+            h = bbox[3] - bbox[1]
+        except Exception:
+            h = 16
+        altura += h + line_spacing
+    return max(altura, 22), lines
+
+
+def gerar_pdf_checklist_local(item_apontamento, respostas, complementos, usuario, foto_path=""):
+    """
+    Gera um PDF local na mesma pasta da foto usando somente Pillow.
+
+    Motivo: evita ReportLab e FPDF2 no Android, removendo erros de compilação/runtime
+    como fontTools ausente. No buildozer.spec, basta manter pillow.
+    """
+    Image, ImageDraw, ImageFont, ImageOps = _safe_import_pillow()
 
     numero_serie = _normaliza_codigo(item_apontamento.get("numero_serie")) or "-"
     op = _normaliza_codigo(item_apontamento.get("op")) or "-"
@@ -337,83 +439,144 @@ def gerar_pdf_checklist_local(item_apontamento, respostas, complementos, usuario
     pasta = pasta_fotos_local(item_apontamento)
     pdf_path = pasta / nome_pdf_local(item_apontamento)
 
-    pdf = FPDF(orientation="P", unit="mm", format="A4")
-    pdf.set_auto_page_break(auto=True, margin=12)
-    pdf.add_page()
+    W, H = 1240, 1754  # A4 aproximado em 150 DPI
+    margem = 70
+    header_blue = (11, 45, 92)
+    border = (203, 213, 225)
+    light = (243, 246, 250)
+    text_color = (17, 24, 39)
+    green = (31, 157, 85)
+    red = (217, 48, 37)
+    amber = (183, 121, 31)
 
-    # Cabeçalho
-    pdf.set_fill_color(11, 45, 92)
-    pdf.set_text_color(255, 255, 255)
-    pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 12, _limpar_texto_pdf(f"Checklist de Qualidade - {tipo}"), border=0, ln=1, align="C", fill=True)
-    pdf.ln(4)
+    font_title = _font_default(34, bold=True)
+    font_head = _font_default(20, bold=True)
+    font_normal = _font_default(18, bold=False)
+    font_small = _font_default(15, bold=False)
+    font_bold = _font_default(18, bold=True)
+
+    pages = []
+
+    def nova_pagina(com_cabecalho=False):
+        img = Image.new("RGB", (W, H), "white")
+        draw = ImageDraw.Draw(img)
+        y = margem
+        if com_cabecalho:
+            draw.rounded_rectangle((margem, y, W - margem, y + 82), radius=18, fill=header_blue)
+            draw.text((margem + 24, y + 22), _limpar_texto_pdf(f"Checklist de Qualidade - {tipo}"), font=font_title, fill="white")
+            y += 112
+        pages.append(img)
+        return img, draw, y
+
+    img, draw, y = nova_pagina(com_cabecalho=True)
 
     # Resumo
-    pdf.set_text_color(17, 24, 39)
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.set_fill_color(243, 246, 250)
-    _pdf_cell_text(pdf, 28, 8, "Serie", fill=True)
-    _pdf_cell_text(pdf, 55, 8, numero_serie, fill=True)
-    _pdf_cell_text(pdf, 28, 8, "OP", fill=True)
-    _pdf_cell_text(pdf, 0, 8, op, fill=True)
-    pdf.ln(8)
-    _pdf_cell_text(pdf, 28, 8, "Tipo", fill=True)
-    _pdf_cell_text(pdf, 55, 8, tipo, fill=True)
-    _pdf_cell_text(pdf, 28, 8, "Inspetor", fill=True)
-    _pdf_cell_text(pdf, 0, 8, _normaliza_codigo(usuario) or "Operador_Logado", fill=True)
-    pdf.ln(8)
-    _pdf_cell_text(pdf, 28, 8, "Inspecao", fill=True)
-    _pdf_cell_text(pdf, 55, 8, data_inspecao, fill=True)
-    _pdf_cell_text(pdf, 28, 8, "Apontamento", fill=True)
-    _pdf_cell_text(pdf, 0, 8, data_apontamento, fill=True)
-    pdf.ln(12)
+    resumo = [
+        ("Serie", numero_serie, "OP", op),
+        ("Tipo", tipo, "Inspetor", _normaliza_codigo(usuario) or "Operador_Logado"),
+        ("Inspecao", data_inspecao, "Apontamento", data_apontamento),
+    ]
+    colx = [margem, margem + 170, margem + 510, margem + 690]
+    colw = [170, 340, 180, W - margem - (margem + 690)]
+    row_h = 46
+    for a, b, c, d in resumo:
+        draw.rectangle((margem, y, W - margem, y + row_h), fill=light, outline=border)
+        draw.line((colx[1], y, colx[1], y + row_h), fill=border, width=1)
+        draw.line((colx[2], y, colx[2], y + row_h), fill=border, width=1)
+        draw.line((colx[3], y, colx[3], y + row_h), fill=border, width=1)
+        draw.text((colx[0] + 10, y + 12), _limpar_texto_pdf(a), font=font_bold, fill=text_color)
+        draw.text((colx[1] + 10, y + 12), _limpar_texto_pdf(b), font=font_normal, fill=text_color)
+        draw.text((colx[2] + 10, y + 12), _limpar_texto_pdf(c), font=font_bold, fill=text_color)
+        draw.text((colx[3] + 10, y + 12), _limpar_texto_pdf(d), font=font_normal, fill=text_color)
+        y += row_h
+    y += 30
 
-    # Tabela
-    pdf.set_font("Helvetica", "B", 9)
-    pdf.set_fill_color(11, 45, 92)
-    pdf.set_text_color(255, 255, 255)
-    widths = [10, 105, 30, 45]
-    _pdf_cell_text(pdf, widths[0], 8, "#", fill=True, align="C")
-    _pdf_cell_text(pdf, widths[1], 8, "Item inspecionado", fill=True, align="C")
-    _pdf_cell_text(pdf, widths[2], 8, "Resposta", fill=True, align="C")
-    _pdf_cell_text(pdf, widths[3], 8, "Complemento", fill=True, align="C")
-    pdf.ln(8)
+    # Cabeçalho da tabela
+    widths = [55, 650, 190, 205]
+    xs = [margem]
+    for w in widths[:-1]:
+        xs.append(xs[-1] + w)
 
-    pdf.set_font("Helvetica", "", 8)
+    def desenhar_cab_tabela(draw, y):
+        draw.rectangle((margem, y, W - margem, y + 46), fill=header_blue)
+        heads = ["#", "Item inspecionado", "Resposta", "Complemento"]
+        for i, head in enumerate(heads):
+            draw.text((xs[i] + 10, y + 13), _limpar_texto_pdf(head), font=font_bold, fill="white")
+            if i > 0:
+                draw.line((xs[i], y, xs[i], y + 46), fill=(255, 255, 255), width=1)
+        return y + 46
+
+    y = desenhar_cab_tabela(draw, y)
+
     perguntas = perguntas_por_tipo(tipo)
     for idx, pergunta in enumerate(perguntas, start=1):
         resposta = resposta_para_texto(respostas.get(idx))
         comp = normalizar_texto(complementos.get(idx, "")) or "-"
-        pdf.set_text_color(17, 24, 39)
-        _pdf_multicell_row(pdf, [str(idx), pergunta, resposta, comp], widths, line_h=4.5)
 
-    pdf.ln(6)
+        h1, _ = _medir_texto_quebrado(draw, pergunta, font_small, widths[1] - 20, line_spacing=3)
+        h2, _ = _medir_texto_quebrado(draw, comp, font_small, widths[3] - 20, line_spacing=3)
+        linha_h = max(52, h1 + 18, h2 + 18)
+
+        if y + linha_h > H - 150:
+            img, draw, y = nova_pagina(com_cabecalho=True)
+            y = desenhar_cab_tabela(draw, y)
+
+        draw.rectangle((margem, y, W - margem, y + linha_h), fill="white", outline=border)
+        for x in xs[1:]:
+            draw.line((x, y, x, y + linha_h), fill=border, width=1)
+
+        draw.text((xs[0] + 18, y + 16), str(idx), font=font_normal, fill=text_color)
+        _draw_text_box(draw, (xs[1] + 10, y + 10), pergunta, font_small, fill=text_color, max_width=widths[1] - 20, line_spacing=3)
+
+        resp_color = text_color
+        if resposta == "Conforme":
+            resp_color = green
+        elif resposta == "Não Conforme" or resposta == "Nao Conforme":
+            resp_color = red
+        elif resposta == "N/A":
+            resp_color = amber
+        draw.text((xs[2] + 10, y + 16), _limpar_texto_pdf(resposta), font=font_bold, fill=resp_color)
+        _draw_text_box(draw, (xs[3] + 10, y + 10), comp, font_small, fill=text_color, max_width=widths[3] - 20, line_spacing=3)
+        y += linha_h
+
+    y += 34
 
     # Foto
-    pdf.set_text_color(17, 24, 39)
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 8, "Foto - vista superior", ln=1)
-    pdf.set_font("Helvetica", "", 9)
+    if y + 80 > H - margem:
+        img, draw, y = nova_pagina(com_cabecalho=True)
+    draw.text((margem, y), "Foto - vista superior", font=font_head, fill=text_color)
+    y += 38
 
     if foto_path and Path(foto_path).exists():
         try:
-            # FPDF usa Pillow internamente para PNG/JPG. Mantém imagem proporcional.
-            y_atual = pdf.get_y()
-            if y_atual > 190:
-                pdf.add_page()
-            pdf.image(str(foto_path), x=15, y=pdf.get_y() + 2, w=180)
-            pdf.ln(105)
+            foto = Image.open(foto_path).convert("RGB")
+            foto = ImageOps.exif_transpose(foto)
+            max_w = W - 2 * margem
+            max_h = H - y - 150
+            if max_h < 420:
+                img, draw, y = nova_pagina(com_cabecalho=True)
+                draw.text((margem, y), "Foto - vista superior", font=font_head, fill=text_color)
+                y += 38
+                max_h = H - y - 150
+            foto.thumbnail((max_w, max_h))
+            x_foto = margem + (max_w - foto.width) // 2
+            draw.rectangle((x_foto - 4, y - 4, x_foto + foto.width + 4, y + foto.height + 4), outline=border, width=2)
+            img.paste(foto, (x_foto, y))
+            y += foto.height + 30
         except Exception as e:
-            pdf.multi_cell(0, 6, _limpar_texto_pdf(f"Nao foi possivel inserir a foto no PDF: {e}"))
+            y = _draw_text_box(draw, (margem, y), f"Nao foi possivel inserir a foto no PDF: {e}", font_normal, fill=red, max_width=W - 2 * margem)
     else:
-        pdf.multi_cell(0, 6, "Foto: nenhuma foto local anexada no momento do salvamento.")
+        y = _draw_text_box(draw, (margem, y), "Foto: nenhuma foto local anexada no momento do salvamento.", font_normal, fill=text_color, max_width=W - 2 * margem)
 
-    pdf.ln(4)
-    pdf.set_font("Helvetica", "", 8)
-    pdf.multi_cell(0, 5, _limpar_texto_pdf(f"Arquivo gerado localmente em: {pdf_path}"))
+    if y + 80 > H - margem:
+        img, draw, y = nova_pagina(com_cabecalho=False)
+    _draw_text_box(draw, (margem, y), f"Arquivo gerado localmente em: {pdf_path}", font_small, fill=(75, 85, 99), max_width=W - 2 * margem)
 
-    pdf.output(str(pdf_path))
+    if not pages:
+        raise RuntimeError("Falha ao criar páginas do PDF.")
+    pages[0].save(str(pdf_path), "PDF", resolution=100.0, save_all=True, append_images=pages[1:])
     return str(pdf_path)
+
 
 def supabase_headers():
     return {
@@ -937,7 +1100,7 @@ class LoginScreen(BaseScreen):
         form.add_widget(Label(text="Pasta padrão para fotos e PDFs", color=TEXT_DARK, halign="left", size_hint_y=None, height=dp(22)))
         pasta_row = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(46))
         self.pasta_padrao = StyledInput("Ex.: C:\\Checklists ou /storage/emulated/0/Documents/Checklists", input_type="text", keyboard_suggestions=True, navy=True)
-        self.pasta_padrao.text = carregar_config_local().get("pasta_padrao", "")
+        self.pasta_padrao.text = carregar_config_local().get("pasta_padrao", "") or str(pasta_base_documentos())
         btn_pasta = StyledButton("Escolher", primary=False, size_hint_x=None, width=dp(110), height=dp(46))
         btn_pasta.bind(on_release=lambda *_: self.escolher_pasta())
         pasta_row.add_widget(self.pasta_padrao)
@@ -963,8 +1126,21 @@ class LoginScreen(BaseScreen):
         self.status.text = msg
 
     def escolher_pasta(self):
-        # Windows/Linux: abre seletor nativo.
-        # Android: se o seletor nativo não abrir, digite manualmente o caminho no campo.
+        """
+        No Android não existe tkinter. Por isso o botão define automaticamente
+        uma pasta pública em Documents/Checklists. No Windows, mantém o seletor nativo.
+        """
+        try:
+            from android.storage import primary_external_storage_path
+            base = primary_external_storage_path()
+            caminho = str(Path(base) / "Documents" / "Checklists")
+            Path(caminho).mkdir(parents=True, exist_ok=True)
+            self.pasta_padrao.text = caminho
+            self.status.text = f"Pasta definida automaticamente\n{caminho}"
+            return
+        except Exception:
+            pass
+
         try:
             import tkinter as tk
             from tkinter import filedialog
@@ -975,8 +1151,14 @@ class LoginScreen(BaseScreen):
             if caminho:
                 self.pasta_padrao.text = caminho
                 self.status.text = f"Pasta selecionada: {caminho}"
-        except Exception as e:
-            self.status.text = f"Digite a pasta manualmente. Seletor não abriu: {e}"
+                return
+        except Exception:
+            pass
+
+        caminho = str(Path(getattr(App.get_running_app(), "user_data_dir", str(BASE_DIR))) / "checklists_fotos")
+        Path(caminho).mkdir(parents=True, exist_ok=True)
+        self.pasta_padrao.text = caminho
+        self.status.text = f"Pasta padrão definida no app\n{caminho}"
 
     def entrar(self):
         app = App.get_running_app()
@@ -1195,7 +1377,13 @@ class ChecklistScreen(BaseScreen):
         app = App.get_running_app()
         item = app.item_atual or {}
         layout = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+
         camera = Camera(index=CAMERA_TRASEIRA_INDEX, play=True, resolution=(1280, 720))
+        try:
+            camera.rotation = int(os.getenv("CAMERA_PREVIEW_ROTATION", "90"))
+        except Exception:
+            camera.rotation = 90
+
         layout.add_widget(camera)
         botoes = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
         btn_capturar = StyledButton("Salvar foto", primary=True)
@@ -1209,11 +1397,40 @@ class ChecklistScreen(BaseScreen):
             try:
                 pasta = pasta_fotos_local(item)
                 arquivo = pasta / nome_foto_local(item)
-                camera.export_to_png(str(arquivo))
+
+                # Captura pela textura para permitir corrigir giro antes de salvar.
+                try:
+                    texture = camera.texture
+                    if texture is None:
+                        raise RuntimeError("Câmera ainda não carregou a imagem. Aguarde 1 segundo e tente novamente.")
+                    size = texture.size
+                    pixels = texture.pixels
+
+                    from PIL import Image
+                    img = Image.frombytes("RGBA", size, pixels)
+
+                    try:
+                        rot = int(os.getenv("FOTO_ROTATION", "90"))
+                    except Exception:
+                        rot = 90
+                    if rot:
+                        img = img.rotate(rot, expand=True)
+
+                    # Ajuste comum do Kivy/Android: evita foto espelhada/invertida em alguns aparelhos.
+                    if os.getenv("FOTO_FLIP_VERTICAL", "0") == "1":
+                        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+                    if os.getenv("FOTO_FLIP_HORIZONTAL", "0") == "1":
+                        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+
+                    img.save(str(arquivo), format="PNG")
+                except Exception:
+                    # Fallback seguro: se a textura falhar, salva pelo método nativo do Kivy.
+                    camera.export_to_png(str(arquivo))
+
                 camera.play = False
                 self.foto_local_path = str(arquivo)
                 if self.lbl_foto:
-                    self.lbl_foto.text = f"Foto salva localmente:\n{arquivo}"
+                    self.lbl_foto.text = f"Foto salva localmente\n{arquivo}"
                 self.set_status(f"Foto salva no tablet: {arquivo.name}")
                 popup.dismiss()
             except Exception as e:
