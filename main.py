@@ -234,23 +234,97 @@ def resposta_para_texto(valor):
     }.get(valor, _normaliza_codigo(valor) or "-")
 
 
+def _limpar_texto_pdf(txt):
+    """Evita caracteres que algumas fontes do FPDF não aceitam bem."""
+    txt = str(txt or "")
+    return (
+        txt.replace("✅", "Conforme")
+        .replace("❌", "Nao Conforme")
+        .replace("🟡", "N/A")
+        .replace("–", "-")
+        .replace("—", "-")
+        .replace("“", '"')
+        .replace("”", '"')
+        .replace("’", "'")
+        .replace("ç", "c")
+        .replace("Ç", "C")
+        .replace("ã", "a")
+        .replace("Ã", "A")
+        .replace("õ", "o")
+        .replace("Õ", "O")
+        .replace("á", "a")
+        .replace("Á", "A")
+        .replace("à", "a")
+        .replace("À", "A")
+        .replace("â", "a")
+        .replace("Â", "A")
+        .replace("é", "e")
+        .replace("É", "E")
+        .replace("ê", "e")
+        .replace("Ê", "E")
+        .replace("í", "i")
+        .replace("Í", "I")
+        .replace("ó", "o")
+        .replace("Ó", "O")
+        .replace("ô", "o")
+        .replace("Ô", "O")
+        .replace("ú", "u")
+        .replace("Ú", "U")
+    )
+
+
+def _pdf_cell_text(pdf, w, h, txt, border=1, align="L", fill=False):
+    txt = _limpar_texto_pdf(txt)
+    try:
+        pdf.cell(w, h, txt, border=border, align=align, fill=fill)
+    except Exception:
+        pdf.cell(w, h, txt.encode("latin-1", "ignore").decode("latin-1"), border=border, align=align, fill=fill)
+
+
+def _pdf_multicell_row(pdf, cols, widths, line_h=5):
+    """
+    Escreve uma linha com multi_cell mantendo bordas alinhadas.
+    cols = textos; widths = larguras em mm.
+    """
+    x0 = pdf.get_x()
+    y0 = pdf.get_y()
+
+    # calcula altura aproximada pela maior quantidade de linhas após quebra simples
+    line_counts = []
+    for txt, w in zip(cols, widths):
+        txt = _limpar_texto_pdf(txt)
+        max_chars = max(8, int(w / 2.2))
+        linhas = 1
+        for parte in txt.split("\n"):
+            linhas += max(0, (len(parte) - 1) // max_chars)
+        line_counts.append(max(1, linhas))
+    row_h = max(line_h * max(line_counts), 8)
+
+    for txt, w in zip(cols, widths):
+        x = pdf.get_x()
+        y = pdf.get_y()
+        pdf.rect(x, y, w, row_h)
+        pdf.multi_cell(w, line_h, _limpar_texto_pdf(txt), border=0)
+        pdf.set_xy(x + w, y)
+
+    pdf.set_xy(x0, y0 + row_h)
+
+
 def gerar_pdf_checklist_local(item_apontamento, respostas, complementos, usuario, foto_path=""):
     """
-    Gera um PDF local na mesma pasta da foto:
-    checklists_fotos / TIPO / NUMERO_SERIE / checklist_SERIE__OP...pdf
+    Gera um PDF local na mesma pasta da foto usando FPDF2.
 
-    Requer no APK: reportlab e pillow no requirements do buildozer.spec.
+    Requer no buildozer.spec:
+    requirements = python3,kivy,requests,tzdata,pillow,fpdf2,urllib3,chardet,idna,certifi
+
+    IMPORTANTE: esta versão remove ReportLab para evitar erro de compilação no Buildozer.
     """
     try:
-        from reportlab.lib import colors
-        from reportlab.lib.pagesizes import A4
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib.units import cm
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+        from fpdf import FPDF
     except Exception as e:
         raise RuntimeError(
-            "Biblioteca reportlab não encontrada. Instale com: pip install reportlab pillow "
-            "e adicione reportlab,pillow no requirements do buildozer.spec. "
+            "Biblioteca fpdf2 não encontrada. Instale com: pip install fpdf2 "
+            "e adicione fpdf2 no requirements do buildozer.spec. "
             f"Erro original: {e}"
         )
 
@@ -263,124 +337,83 @@ def gerar_pdf_checklist_local(item_apontamento, respostas, complementos, usuario
     pasta = pasta_fotos_local(item_apontamento)
     pdf_path = pasta / nome_pdf_local(item_apontamento)
 
-    doc = SimpleDocTemplate(
-        str(pdf_path),
-        pagesize=A4,
-        rightMargin=1.2 * cm,
-        leftMargin=1.2 * cm,
-        topMargin=1.0 * cm,
-        bottomMargin=1.0 * cm,
-    )
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.add_page()
 
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        "TituloChecklist",
-        parent=styles["Title"],
-        fontName="Helvetica-Bold",
-        fontSize=18,
-        leading=22,
-        textColor=colors.HexColor("#0B2D5C"),
-        spaceAfter=10,
-    )
-    normal_style = ParagraphStyle(
-        "NormalChecklist",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=9,
-        leading=12,
-    )
-    question_style = ParagraphStyle(
-        "PerguntaChecklist",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=8.5,
-        leading=10,
-    )
+    # Cabeçalho
+    pdf.set_fill_color(11, 45, 92)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 12, _limpar_texto_pdf(f"Checklist de Qualidade - {tipo}"), border=0, ln=1, align="C", fill=True)
+    pdf.ln(4)
 
-    story = []
-    story.append(Paragraph(f"Checklist de Qualidade - {tipo}", title_style))
+    # Resumo
+    pdf.set_text_color(17, 24, 39)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_fill_color(243, 246, 250)
+    _pdf_cell_text(pdf, 28, 8, "Serie", fill=True)
+    _pdf_cell_text(pdf, 55, 8, numero_serie, fill=True)
+    _pdf_cell_text(pdf, 28, 8, "OP", fill=True)
+    _pdf_cell_text(pdf, 0, 8, op, fill=True)
+    pdf.ln(8)
+    _pdf_cell_text(pdf, 28, 8, "Tipo", fill=True)
+    _pdf_cell_text(pdf, 55, 8, tipo, fill=True)
+    _pdf_cell_text(pdf, 28, 8, "Inspetor", fill=True)
+    _pdf_cell_text(pdf, 0, 8, _normaliza_codigo(usuario) or "Operador_Logado", fill=True)
+    pdf.ln(8)
+    _pdf_cell_text(pdf, 28, 8, "Inspecao", fill=True)
+    _pdf_cell_text(pdf, 55, 8, data_inspecao, fill=True)
+    _pdf_cell_text(pdf, 28, 8, "Apontamento", fill=True)
+    _pdf_cell_text(pdf, 0, 8, data_apontamento, fill=True)
+    pdf.ln(12)
 
-    resumo_data = [
-        ["Série", numero_serie, "OP", op],
-        ["Tipo", tipo, "Inspetor", _normaliza_codigo(usuario) or "Operador_Logado"],
-        ["Data inspeção", data_inspecao, "Data apontamento", data_apontamento],
-    ]
-    resumo = Table(resumo_data, colWidths=[2.8 * cm, 5.0 * cm, 3.2 * cm, 6.2 * cm])
-    resumo.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F3F6FA")),
-        ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#111827")),
-        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-        ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CBD5E1")),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("FONTSIZE", (0, 0), (-1, -1), 8.5),
-        ("LEFTPADDING", (0, 0), (-1, -1), 6),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-    ]))
-    story.append(resumo)
-    story.append(Spacer(1, 0.35 * cm))
+    # Tabela
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_fill_color(11, 45, 92)
+    pdf.set_text_color(255, 255, 255)
+    widths = [10, 105, 30, 45]
+    _pdf_cell_text(pdf, widths[0], 8, "#", fill=True, align="C")
+    _pdf_cell_text(pdf, widths[1], 8, "Item inspecionado", fill=True, align="C")
+    _pdf_cell_text(pdf, widths[2], 8, "Resposta", fill=True, align="C")
+    _pdf_cell_text(pdf, widths[3], 8, "Complemento", fill=True, align="C")
+    pdf.ln(8)
 
+    pdf.set_font("Helvetica", "", 8)
     perguntas = perguntas_por_tipo(tipo)
-    tabela = [["#", "Item inspecionado", "Resposta", "Complemento"]]
     for idx, pergunta in enumerate(perguntas, start=1):
+        resposta = resposta_para_texto(respostas.get(idx))
         comp = normalizar_texto(complementos.get(idx, "")) or "-"
-        tabela.append([
-            str(idx),
-            Paragraph(pergunta, question_style),
-            resposta_para_texto(respostas.get(idx)),
-            Paragraph(comp, normal_style),
-        ])
+        pdf.set_text_color(17, 24, 39)
+        _pdf_multicell_row(pdf, [str(idx), pergunta, resposta, comp], widths, line_h=4.5)
 
-    table = Table(tabela, colWidths=[0.8 * cm, 10.5 * cm, 3.0 * cm, 3.3 * cm], repeatRows=1)
-    table_style = TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0B2D5C")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, 0), 8.5),
-        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#CBD5E1")),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("FONTSIZE", (0, 1), (-1, -1), 8),
-        ("LEFTPADDING", (0, 0), (-1, -1), 4),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-    ])
-    for row_idx in range(1, len(tabela)):
-        resposta = tabela[row_idx][2]
-        if resposta == "Conforme":
-            table_style.add("TEXTCOLOR", (2, row_idx), (2, row_idx), colors.HexColor("#1F9D55"))
-        elif resposta == "Não Conforme":
-            table_style.add("TEXTCOLOR", (2, row_idx), (2, row_idx), colors.HexColor("#D93025"))
-        elif resposta == "N/A":
-            table_style.add("TEXTCOLOR", (2, row_idx), (2, row_idx), colors.HexColor("#B7791F"))
-    table.setStyle(table_style)
+    pdf.ln(6)
 
-    story.append(table)
-    story.append(Spacer(1, 0.35 * cm))
+    # Foto
+    pdf.set_text_color(17, 24, 39)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 8, "Foto - vista superior", ln=1)
+    pdf.set_font("Helvetica", "", 9)
 
     if foto_path and Path(foto_path).exists():
-        story.append(Paragraph("Foto anexada - vista superior", styles["Heading3"]))
         try:
-            img = Image(foto_path)
-            max_w = 16.5 * cm
-            max_h = 10.0 * cm
-            ratio = min(max_w / img.imageWidth, max_h / img.imageHeight)
-            img.drawWidth = img.imageWidth * ratio
-            img.drawHeight = img.imageHeight * ratio
-            story.append(img)
+            # FPDF usa Pillow internamente para PNG/JPG. Mantém imagem proporcional.
+            y_atual = pdf.get_y()
+            if y_atual > 190:
+                pdf.add_page()
+            pdf.image(str(foto_path), x=15, y=pdf.get_y() + 2, w=180)
+            pdf.ln(105)
         except Exception as e:
-            story.append(Paragraph(f"Não foi possível inserir a foto no PDF: {e}", normal_style))
+            pdf.multi_cell(0, 6, _limpar_texto_pdf(f"Nao foi possivel inserir a foto no PDF: {e}"))
     else:
-        story.append(Paragraph("Foto: nenhuma foto local anexada no momento do salvamento.", normal_style))
+        pdf.multi_cell(0, 6, "Foto: nenhuma foto local anexada no momento do salvamento.")
 
-    story.append(Spacer(1, 0.25 * cm))
-    story.append(Paragraph(f"Arquivo gerado localmente em: {pdf_path}", normal_style))
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "", 8)
+    pdf.multi_cell(0, 5, _limpar_texto_pdf(f"Arquivo gerado localmente em: {pdf_path}"))
 
-    doc.build(story)
+    pdf.output(str(pdf_path))
     return str(pdf_path)
-
 
 def supabase_headers():
     return {
