@@ -535,13 +535,10 @@ def gerar_pdf_checklist_local(item_apontamento, respostas, complementos, usuario
 
     y = desenhar_cab_tabela(draw, y)
 
-    perguntas = perguntas_por_tipo(tipo)
-    for idx, pergunta in enumerate(perguntas, start=1):
-        resposta = resposta_para_texto(respostas.get(idx))
-        comp = normalizar_texto(complementos.get(idx, "")) or "-"
-
-        h1, _ = _medir_texto_quebrado(draw, pergunta, font_small, widths[1] - 20, line_spacing=3)
-        h2, _ = _medir_texto_quebrado(draw, comp, font_small, widths[3] - 20, line_spacing=3)
+    def desenhar_linha_tabela(numero, item_txt, resposta_txt, complemento_txt):
+        nonlocal img, draw, y
+        h1, _ = _medir_texto_quebrado(draw, item_txt, font_small, widths[1] - 20, line_spacing=3)
+        h2, _ = _medir_texto_quebrado(draw, complemento_txt, font_small, widths[3] - 20, line_spacing=3)
         linha_h = max(52, h1 + 18, h2 + 18)
 
         if y + linha_h > H - 150:
@@ -552,19 +549,30 @@ def gerar_pdf_checklist_local(item_apontamento, respostas, complementos, usuario
         for x in xs[1:]:
             draw.line((x, y, x, y + linha_h), fill=border, width=1)
 
-        draw.text((xs[0] + 18, y + 16), str(idx), font=font_normal, fill=text_color)
-        _draw_text_box(draw, (xs[1] + 10, y + 10), pergunta, font_small, fill=text_color, max_width=widths[1] - 20, line_spacing=3)
+        draw.text((xs[0] + 18, y + 16), str(numero), font=font_normal, fill=text_color)
+        _draw_text_box(draw, (xs[1] + 10, y + 10), item_txt, font_small, fill=text_color, max_width=widths[1] - 20, line_spacing=3)
 
         resp_color = text_color
-        if resposta == "Conforme":
+        if resposta_txt == "Conforme":
             resp_color = green
-        elif resposta == "Não Conforme" or resposta == "Nao Conforme":
+        elif resposta_txt == "Não Conforme" or resposta_txt == "Nao Conforme":
             resp_color = red
-        elif resposta == "N/A":
+        elif resposta_txt == "N/A":
             resp_color = amber
-        draw.text((xs[2] + 10, y + 16), _limpar_texto_pdf(resposta), font=font_bold, fill=resp_color)
-        _draw_text_box(draw, (xs[3] + 10, y + 10), comp, font_small, fill=text_color, max_width=widths[3] - 20, line_spacing=3)
+        draw.text((xs[2] + 10, y + 16), _limpar_texto_pdf(resposta_txt), font=font_bold, fill=resp_color)
+        _draw_text_box(draw, (xs[3] + 10, y + 10), complemento_txt, font_small, fill=text_color, max_width=widths[3] - 20, line_spacing=3)
         y += linha_h
+
+    if is_eixo(tipo):
+        rastreio_esq = normalizar_texto(complementos.get("RASTREIO_ESQ", "")) or "-"
+        rastreio_dir = normalizar_texto(complementos.get("RASTREIO_DIR", "")) or "-"
+        desenhar_linha_tabela("R", "RASTREIO_CUBO", "Informado", f"E:{rastreio_esq} / D:{rastreio_dir}")
+
+    perguntas = perguntas_por_tipo(tipo)
+    for idx, pergunta in enumerate(perguntas, start=1):
+        resposta = resposta_para_texto(respostas.get(idx))
+        comp = normalizar_texto(complementos.get(idx, "")) or "-"
+        desenhar_linha_tabela(idx, pergunta, resposta, comp)
 
     y += 34
 
@@ -952,6 +960,19 @@ def salvar_checklist_supabase(item_apontamento, respostas, complementos, usuario
 
     if is_eixo(tipo_producao):
         reprovado = any(status_emoji_para_texto(respostas.get(idx)) == "Não Conforme" for idx in range(1, len(perguntas) + 1))
+        data_hora_eixo = _agora_utc_iso()
+        rastreio_esq = normalizar_texto(complementos.get("RASTREIO_ESQ", "")) or "-"
+        rastreio_dir = normalizar_texto(complementos.get("RASTREIO_DIR", "")) or "-"
+        registros.append({
+            "numero_serie": numero_serie,
+            "item": "RASTREIO_CUBO",
+            "status": "Informado",
+            "observacoes": f"E:{rastreio_esq} / D:{rastreio_dir}",
+            "inspetor": usuario,
+            "data_hora": data_hora_eixo,
+            "produto_reprovado": "Sim" if reprovado else "Não",
+            "reinspecao": "Não",
+        })
         for idx, _pergunta in enumerate(perguntas, start=1):
             emoji = respostas.get(idx)
             item_final = keys.get(idx, f"ITEM_{idx}")
@@ -962,7 +983,7 @@ def salvar_checklist_supabase(item_apontamento, respostas, complementos, usuario
                 "status": status_emoji_para_texto(emoji),
                 "observacoes": comp or "",
                 "inspetor": usuario,
-                "data_hora": _agora_utc_iso(),
+                "data_hora": data_hora_eixo,
                 "produto_reprovado": "Sim" if reprovado else "Não",
                 "reinspecao": "Não",
             })
@@ -1579,6 +1600,8 @@ class ChecklistScreen(BaseScreen):
         self.foto_local_path = ""
         self.lbl_foto = None
         self._foto_pendente_path = ""
+        self.rastreio_esq_input = None
+        self.rastreio_dir_input = None
         outer = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(14))
         self.add_widget(outer)
         topo = GradientCard(orientation="horizontal", size_hint_y=None, height=dp(94), padding=dp(16), spacing=dp(8))
@@ -1625,6 +1648,39 @@ class ChecklistScreen(BaseScreen):
         self.content.clear_widgets()
         self.question_cards = {}
         self.respostas = {}
+        self.rastreio_esq_input = None
+        self.rastreio_dir_input = None
+
+        if is_eixo(tipo):
+            rastreio_card = Card(orientation="vertical", padding=dp(12), spacing=dp(8), size_hint_y=None, height=dp(130), bg=CARD_BG, border=CARD_BORDER)
+            rastreio_card.add_widget(Label(
+                text="Rastreio Cubo (E / D)",
+                color=TEXT_DARK,
+                bold=True,
+                halign="left",
+                valign="middle",
+                size_hint_y=None,
+                height=dp(28),
+            ))
+            rastreio_row = BoxLayout(orientation="horizontal", spacing=dp(10), size_hint_y=None, height=dp(48))
+            self.rastreio_esq_input = StyledInput("E", input_type="text", keyboard_suggestions=False, size_hint_y=None, height=dp(46), navy=False)
+            self.rastreio_esq_input.max_text_length = 4
+            self.rastreio_dir_input = StyledInput("D", input_type="text", keyboard_suggestions=False, size_hint_y=None, height=dp(46), navy=False)
+            self.rastreio_dir_input.max_text_length = 4
+            rastreio_row.add_widget(self.rastreio_esq_input)
+            rastreio_row.add_widget(self.rastreio_dir_input)
+            rastreio_card.add_widget(rastreio_row)
+            rastreio_card.add_widget(Label(
+                text="Digite o rastreio do cubo esquerdo e direito. Ex.: E:290 / D:450",
+                color=TEXT_MUTED,
+                font_size="12sp",
+                halign="left",
+                valign="middle",
+                size_hint_y=None,
+                height=dp(24),
+            ))
+            self.content.add_widget(rastreio_card)
+
         perguntas = perguntas_por_tipo(tipo)
         for idx, pergunta in enumerate(perguntas, start=1):
             qcard = QuestionCard(idx, pergunta, on_change=self._on_resposta_change, tipo_producao=tipo)
@@ -1940,6 +1996,9 @@ class ChecklistScreen(BaseScreen):
             self.set_status(f"⚠️ Responda todos os itens. Falta(m): {', '.join(str(x) for x in faltantes)}")
             return
         complementos = {idx: qcard.get_complemento() for idx, qcard in self.question_cards.items()}
+        if is_eixo(tipo):
+            complementos["RASTREIO_ESQ"] = normalizar_texto(self.rastreio_esq_input.text if self.rastreio_esq_input else "")
+            complementos["RASTREIO_DIR"] = normalizar_texto(self.rastreio_dir_input.text if self.rastreio_dir_input else "")
         if tipo == "MOLA":
             faltam_obs = [idx for idx in ITENS_OBS_OBRIGATORIA_MOLA if not normalizar_texto(complementos.get(idx, ""))]
             if faltam_obs:
@@ -2055,3 +2114,4 @@ class ChecklistRevisaoApp(App):
 
 if __name__ == "__main__":
     ChecklistRevisaoApp().run()
+
