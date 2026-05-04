@@ -29,6 +29,8 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
 from kivy.uix.popup import Popup
+from kivy.uix.floatlayout import FloatLayout
+from kivy.uix.scatter import Scatter
 
 try:
     from kivy.uix.camera import Camera
@@ -1521,24 +1523,82 @@ class ChecklistScreen(BaseScreen):
         Clock.schedule_once(lambda dt: self._finalizar_foto_nativa(self._foto_pendente_path), 0)
 
     def _abrir_camera_kivy_popup(self, item):
+        """
+        Fallback seguro usando câmera interna do Kivy.
+        Agora o preview abre já rotacionado dentro de um container, sem precisar clicar em Girar.
+
+        Ajustes possíveis via teste.env, se algum tablet inverter:
+        CAMERA_PREVIEW_ROTATION=270   # 0, 90, 180 ou 270
+        FOTO_ROTATION=270             # rotação aplicada no arquivo salvo
+        FOTO_FLIP_HORIZONTAL=0
+        FOTO_FLIP_VERTICAL=0
+        """
         if Camera is None:
             self.set_status("Erro: câmera não disponível neste ambiente. No APK Android, confira a permissão CAMERA no buildozer.spec.")
             return
 
-        layout = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
-        camera = Camera(index=CAMERA_TRASEIRA_INDEX, play=True, resolution=(1280, 720))
         try:
-            camera.rotation = int(os.getenv("CAMERA_PREVIEW_ROTATION", "270"))
+            preview_rotation = int(os.getenv("CAMERA_PREVIEW_ROTATION", "270"))
         except Exception:
-            camera.rotation = 270
+            preview_rotation = 270
 
-        layout.add_widget(camera)
+        try:
+            foto_rotation = int(os.getenv("FOTO_ROTATION", str(preview_rotation)))
+        except Exception:
+            foto_rotation = preview_rotation
+
+        layout = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+
+        preview_area = FloatLayout(size_hint_y=1)
+        camera = Camera(index=CAMERA_TRASEIRA_INDEX, play=True, resolution=(1920, 1080))
+        camera.allow_stretch = True
+        camera.keep_ratio = True
+
+        # Rotaciona o WIDGET da câmera, não apenas a imagem salva.
+        # Isso corrige o preview que estava abrindo deitado no tablet.
+        scatter = Scatter(
+            do_rotation=False,
+            do_translation=False,
+            do_scale=False,
+            auto_bring_to_front=False,
+        )
+        scatter.rotation = preview_rotation
+        scatter.add_widget(camera)
+        preview_area.add_widget(scatter)
+
+        def ajustar_preview(*_):
+            w, h = preview_area.size
+            if w <= 0 or h <= 0:
+                return
+
+            rot = abs(preview_rotation) % 180
+            if rot == 90:
+                # Quando gira 90/270, troca largura/altura para ocupar o espaço corretamente.
+                cam_w, cam_h = h, w
+            else:
+                cam_w, cam_h = w, h
+
+            camera.size_hint = (None, None)
+            camera.pos = (0, 0)
+            camera.size = (cam_w, cam_h)
+
+            scatter.size_hint = (None, None)
+            scatter.size = (cam_w, cam_h)
+            scatter.center = preview_area.center
+
+        preview_area.bind(size=ajustar_preview, pos=ajustar_preview)
+        Clock.schedule_once(lambda dt: ajustar_preview(), 0.1)
+        Clock.schedule_once(lambda dt: ajustar_preview(), 0.6)
+
+        layout.add_widget(preview_area)
+
         botoes = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
         btn_capturar = StyledButton("Salvar foto", primary=True)
         btn_fechar = StyledButton("Fechar", primary=False)
         botoes.add_widget(btn_capturar)
         botoes.add_widget(btn_fechar)
         layout.add_widget(botoes)
+
         popup = Popup(title="Foto - vista superior", content=layout, size_hint=(0.94, 0.94))
 
         def capturar(*_):
@@ -1546,41 +1606,26 @@ class ChecklistScreen(BaseScreen):
                 pasta = pasta_fotos_local(item)
                 arquivo = pasta / nome_foto_local(item)
 
-                try:
-                    texture = camera.texture
-                    if texture is None:
-                        raise RuntimeError("Câmera ainda não carregou a imagem. Aguarde 1 segundo e tente novamente.")
-                    size = texture.size
-                    pixels = texture.pixels
-                    from PIL import Image
-                    img = Image.frombytes("RGBA", size, pixels)
-                    try:
-                        rot = int(os.getenv("FOTO_ROTATION", "270"))
-                    except Exception:
-                        rot = 270
-                    if rot:
-                        img = img.rotate(rot, expand=True)
-                    if os.getenv("FOTO_FLIP_VERTICAL", "0") == "1":
-                        img = img.transpose(Image.FLIP_TOP_BOTTOM)
-                    if os.getenv("FOTO_FLIP_HORIZONTAL", "0") == "1":
-                        img = img.transpose(Image.FLIP_LEFT_RIGHT)
-                    if img.mode != "RGB":
-                        img = img.convert("RGB")
-                    img.save(str(arquivo), format="JPEG", quality=95)
-                except Exception:
-                    # Fallback: exporta do Kivy e normaliza depois.
-                    tmp_png = str(arquivo).replace(".jpg", ".png")
-                    camera.export_to_png(tmp_png)
-                    try:
-                        from PIL import Image
-                        img = Image.open(tmp_png).convert("RGB")
-                        img.save(str(arquivo), format="JPEG", quality=95)
-                        try:
-                            Path(tmp_png).unlink()
-                        except Exception:
-                            pass
-                    except Exception:
-                        arquivo = Path(tmp_png)
+                texture = camera.texture
+                if texture is None:
+                    raise RuntimeError("Câmera ainda não carregou a imagem. Aguarde 1 segundo e tente novamente.")
+
+                size = texture.size
+                pixels = texture.pixels
+
+                from PIL import Image
+                img = Image.frombytes("RGBA", size, pixels)
+
+                if foto_rotation:
+                    img = img.rotate(foto_rotation, expand=True)
+                if os.getenv("FOTO_FLIP_VERTICAL", "0") == "1":
+                    img = img.transpose(Image.FLIP_TOP_BOTTOM)
+                if os.getenv("FOTO_FLIP_HORIZONTAL", "0") == "1":
+                    img = img.transpose(Image.FLIP_LEFT_RIGHT)
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+
+                img.save(str(arquivo), format="JPEG", quality=95)
 
                 camera.play = False
                 self.foto_local_path = str(arquivo)
@@ -1602,6 +1647,7 @@ class ChecklistScreen(BaseScreen):
         btn_fechar.bind(on_release=fechar)
         popup.bind(on_dismiss=lambda *_: setattr(camera, "play", False))
         popup.open()
+
     def salvar(self):
         if self.busy:
             return
