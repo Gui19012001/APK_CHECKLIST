@@ -15,14 +15,13 @@ import requests
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.window import Window
-from kivy.graphics import Color, RoundedRectangle, Line, Rectangle, PushMatrix, PopMatrix, Rotate
+from kivy.utils import platform
+from kivy.graphics import Color, RoundedRectangle, Line
 from kivy.graphics.texture import Texture
 from kivy.core.text import Label as CoreLabel
 from kivy.metrics import dp
 from kivy.properties import StringProperty, BooleanProperty
 from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.floatlayout import FloatLayout
-from kivy.uix.widget import Widget
 from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.screenmanager import ScreenManager, Screen
@@ -35,6 +34,12 @@ try:
     from kivy.uix.camera import Camera
 except Exception:
     Camera = None
+
+try:
+    # Plyer abre a câmera nativa do Android, mantendo melhor qualidade do sensor.
+    from plyer import camera as native_camera
+except Exception:
+    native_camera = None
 
 BG_APP = (1, 1, 1, 1)
 CARD_BG = (1, 1, 1, 1)
@@ -103,30 +108,6 @@ try:
     CAMERA_TRASEIRA_INDEX = int(os.getenv("CAMERA_TRASEIRA_INDEX", "0"))
 except Exception:
     CAMERA_TRASEIRA_INDEX = 0
-
-# Ajustes de câmera por tablet industrial.
-# Padrão: resolução retrato e preview sem giro.
-# Se algum tablet precisar, altere no teste.env:
-# CAMERA_PREVIEW_ROTATION=90 ou 270 / FOTO_ROTATION=90 ou 270
-try:
-    CAMERA_PREVIEW_ROTATION = int(os.getenv("CAMERA_PREVIEW_ROTATION", "0"))
-except Exception:
-    CAMERA_PREVIEW_ROTATION = 0
-
-try:
-    FOTO_ROTATION = int(os.getenv("FOTO_ROTATION", "0"))
-except Exception:
-    FOTO_ROTATION = 0
-
-try:
-    CAMERA_RES_W = int(os.getenv("CAMERA_RES_W", "720"))
-except Exception:
-    CAMERA_RES_W = 720
-
-try:
-    CAMERA_RES_H = int(os.getenv("CAMERA_RES_H", "1280"))
-except Exception:
-    CAMERA_RES_H = 1280
 
 try:
     from zoneinfo import ZoneInfo
@@ -223,20 +204,20 @@ def pasta_base_documentos():
         except Exception:
             pass
 
-    # Android: tenta usar pasta pública Documents/Checklists.
-    # Se o Android bloquear gravação por permissão/scoped storage, usa pasta privada do app.
-    try:
-        from android.storage import primary_external_storage_path
-        base = Path(primary_external_storage_path()) / "Documents" / "Checklists"
-        base.mkdir(parents=True, exist_ok=True)
-        return base
-    except Exception:
-        pass
+    # Android: usa uma pasta pública padrão para facilitar acesso e permitir câmera nativa.
+    # Caso o Android bloqueie o acesso público por política de armazenamento, cai para user_data_dir.
+    if platform == "android":
+        try:
+            from android.storage import primary_external_storage_path
+            base = Path(primary_external_storage_path()) / "Documents" / "Checklists"
+            base.mkdir(parents=True, exist_ok=True)
+            return base
+        except Exception:
+            pass
 
     base = Path(getattr(app, "user_data_dir", str(BASE_DIR))) / "checklists_fotos"
     base.mkdir(parents=True, exist_ok=True)
     return base
-
 
 def pasta_fotos_local(item_apontamento):
     base = pasta_base_documentos()
@@ -251,7 +232,7 @@ def nome_foto_local(item_apontamento):
     op = _normaliza_codigo(item_apontamento.get("op")) or "NA"
     serie = _normaliza_codigo(item_apontamento.get("numero_serie")) or "NA"
     ts = datetime.datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
-    return f"{serie}__OP{op}__vista_superior__{ts}.png"
+    return f"{serie}__OP{op}__vista_superior__{ts}.jpg"
 
 def nome_pdf_local(item_apontamento):
     op = _normaliza_codigo(item_apontamento.get("op")) or "NA"
@@ -842,56 +823,6 @@ def complemento_config(tipo_producao, idx):
 
 
 
-
-class CameraTexturePreview(Widget):
-    """
-    Preview próprio para Android industrial.
-    O Camera do Kivy às vezes entrega a textura deitada quando o app está em portrait.
-    Esta classe desenha a textura no canvas e permite girar o preview sem mexer na tela do app.
-    """
-    def __init__(self, camera_widget, rotation_angle=0, **kwargs):
-        super().__init__(**kwargs)
-        self.camera_widget = camera_widget
-        self.rotation_angle = int(rotation_angle or 0) % 360
-
-        with self.canvas:
-            PushMatrix()
-            self._rotate = Rotate(angle=self.rotation_angle, origin=self.center)
-            self._color = Color(1, 1, 1, 1)
-            self._rect = Rectangle(pos=self.pos, size=self.size)
-            PopMatrix()
-
-        self.bind(pos=self._update_canvas, size=self._update_canvas)
-        Clock.schedule_interval(self._sync_texture, 1 / 15.0)
-
-    def set_rotation(self, angle):
-        self.rotation_angle = int(angle or 0) % 360
-        self._update_canvas()
-
-    def rotate_right(self):
-        self.set_rotation(self.rotation_angle + 90)
-        return self.rotation_angle
-
-    def _update_canvas(self, *_):
-        self._rotate.angle = self.rotation_angle
-        self._rotate.origin = self.center
-
-        if self.rotation_angle % 180 == 90:
-            w, h = self.height, self.width
-        else:
-            w, h = self.width, self.height
-
-        self._rect.size = (w, h)
-        self._rect.pos = (self.center_x - w / 2, self.center_y - h / 2)
-
-    def _sync_texture(self, *_):
-        try:
-            tex = self.camera_widget.texture
-            if tex is not None:
-                self._rect.texture = tex
-        except Exception:
-            pass
-
 class BaseScreen(Screen):
     def on_touch_down(self, touch):
         app = App.get_running_app()
@@ -1365,6 +1296,7 @@ class ChecklistScreen(BaseScreen):
         self.respostas = {}
         self.foto_local_path = ""
         self.lbl_foto = None
+        self._foto_pendente_path = ""
         outer = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(14))
         self.add_widget(outer)
         topo = GradientCard(orientation="horizontal", size_hint_y=None, height=dp(94), padding=dp(16), spacing=dp(8))
@@ -1445,52 +1377,169 @@ class ChecklistScreen(BaseScreen):
         self.respostas[idx] = emoji
 
     def abrir_camera(self):
-        if Camera is None:
-            self.set_status("Erro: câmera não disponível neste ambiente. No APK Android, confira a permissão CAMERA no buildozer.spec.")
-            return
-
+        """
+        Abre a câmera NATIVA do Android para evitar perda de qualidade e problemas de preview girado.
+        Fallback: se estiver rodando no Windows ou se a câmera nativa falhar, abre a câmera interna do Kivy.
+        """
         garantir_permissao_camera_android()
         app = App.get_running_app()
         item = app.item_atual or {}
 
+        try:
+            pasta = pasta_fotos_local(item)
+            arquivo = pasta / nome_foto_local(item)
+            self._foto_pendente_path = str(arquivo)
+        except Exception as e:
+            self.set_status(f"Erro ao preparar pasta da foto: {e}")
+            return
+
+        # 1) Preferência no APK: câmera nativa via Plyer.
+        # Para funcionar, manter no buildozer.spec: requirements = ...,plyer,...
+        if native_camera is not None:
+            try:
+                native_camera.take_picture(
+                    filename=self._foto_pendente_path,
+                    on_complete=self._foto_nativa_concluida,
+                )
+                self.set_status("Câmera nativa aberta. Tire a foto e confirme no app da câmera.")
+                return
+            except Exception as e:
+                # Continua para tentativa por Intent manual / fallback Kivy.
+                self.set_status(f"Câmera nativa via Plyer falhou. Tentando alternativa. Detalhe: {e}")
+
+        # 2) Android sem Plyer: tenta Intent nativa manual.
+        if platform == "android":
+            try:
+                if self._abrir_camera_nativa_android(self._foto_pendente_path):
+                    return
+            except Exception as e:
+                self.set_status(f"Câmera nativa Android falhou. Abrindo câmera interna. Detalhe: {e}")
+
+        # 3) Fallback desktop/seguro: câmera interna Kivy.
+        self._abrir_camera_kivy_popup(item)
+
+    def _foto_nativa_concluida(self, filename=None, *args):
+        # Callback pode vir fora da thread principal.
+        Clock.schedule_once(lambda dt: self._finalizar_foto_nativa(filename), 0)
+
+    def _finalizar_foto_nativa(self, filename=None):
+        caminho = _normaliza_codigo(filename) or self._foto_pendente_path
+        if caminho.startswith("content://"):
+            # Alguns providers retornam URI; nesse caso o arquivo planejado costuma ser o válido.
+            caminho = self._foto_pendente_path
+
+        arquivo = Path(caminho)
+        if not arquivo.exists() or arquivo.stat().st_size <= 0:
+            self.set_status("Foto não foi salva. Abra a câmera novamente e confirme a captura.")
+            return
+
+        try:
+            self._normalizar_foto_pos_camera(arquivo)
+        except Exception:
+            # Não bloqueia o fluxo se a normalização falhar.
+            pass
+
+        self.foto_local_path = str(arquivo)
+        if self.lbl_foto:
+            self.lbl_foto.text = f"Foto salva localmente\n{arquivo}"
+        self.set_status(f"Foto salva com câmera nativa: {arquivo.name}")
+
+    def _normalizar_foto_pos_camera(self, arquivo):
+        """Aplica orientação EXIF da câmera nativa sem reduzir qualidade perceptível."""
+        try:
+            from PIL import Image, ImageOps
+            img = Image.open(str(arquivo))
+            img = ImageOps.exif_transpose(img)
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            # Mantém qualidade alta. Para PNG/JPG, Pillow escolhe pelo formato informado.
+            img.save(str(arquivo), quality=95)
+        except Exception:
+            raise
+
+    def _abrir_camera_nativa_android(self, arquivo_path):
+        """
+        Fallback nativo por Intent. O Plyer é preferível, mas este caminho ajuda em builds sem Plyer.
+        """
+        try:
+            from jnius import autoclass
+            from android import activity
+
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            Intent = autoclass("android.content.Intent")
+            MediaStore = autoclass("android.provider.MediaStore")
+            Uri = autoclass("android.net.Uri")
+            File = autoclass("java.io.File")
+
+            try:
+                StrictMode = autoclass("android.os.StrictMode")
+                StrictMode.disableDeathOnFileUriExposure()
+            except Exception:
+                pass
+
+            arquivo = File(arquivo_path)
+            parent = arquivo.getParentFile()
+            if parent is not None and not parent.exists():
+                parent.mkdirs()
+
+            uri = Uri.fromFile(arquivo)
+            intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
+            intent.putExtra(MediaStore.EXTRA_OUTPUT, uri)
+
+            self._camera_request_code = 7813
+            try:
+                activity.unbind(on_activity_result=self._on_camera_activity_result)
+            except Exception:
+                pass
+            activity.bind(on_activity_result=self._on_camera_activity_result)
+
+            PythonActivity.mActivity.startActivityForResult(intent, self._camera_request_code)
+            self.set_status("Câmera nativa aberta. Tire a foto e confirme.")
+            return True
+        except Exception:
+            try:
+                from android import activity
+                activity.unbind(on_activity_result=self._on_camera_activity_result)
+            except Exception:
+                pass
+            return False
+
+    def _on_camera_activity_result(self, request_code, result_code, intent):
+        try:
+            if int(request_code) != int(getattr(self, "_camera_request_code", -1)):
+                return
+        except Exception:
+            return
+
+        try:
+            from android import activity
+            activity.unbind(on_activity_result=self._on_camera_activity_result)
+        except Exception:
+            pass
+
+        # RESULT_OK normalmente é -1, mas se o arquivo existir, aceitamos mesmo assim.
+        Clock.schedule_once(lambda dt: self._finalizar_foto_nativa(self._foto_pendente_path), 0)
+
+    def _abrir_camera_kivy_popup(self, item):
+        if Camera is None:
+            self.set_status("Erro: câmera não disponível neste ambiente. No APK Android, confira a permissão CAMERA no buildozer.spec.")
+            return
+
         layout = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+        camera = Camera(index=CAMERA_TRASEIRA_INDEX, play=True, resolution=(1280, 720))
+        try:
+            camera.rotation = int(os.getenv("CAMERA_PREVIEW_ROTATION", "270"))
+        except Exception:
+            camera.rotation = 270
 
-        preview_area = FloatLayout(size_hint_y=1)
-
-        camera = Camera(
-            index=CAMERA_TRASEIRA_INDEX,
-            play=True,
-            resolution=(CAMERA_RES_W, CAMERA_RES_H),
-            size_hint=(None, None),
-            size=(dp(1), dp(1)),
-            opacity=0,
-        )
-
-        preview = CameraTexturePreview(
-            camera,
-            rotation_angle=CAMERA_PREVIEW_ROTATION,
-            size_hint=(1, 1),
-            pos_hint={"x": 0, "y": 0},
-        )
-
-        preview_area.add_widget(preview)
-        preview_area.add_widget(camera)
-        layout.add_widget(preview_area)
-
+        layout.add_widget(camera)
         botoes = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
         btn_capturar = StyledButton("Salvar foto", primary=True)
-        btn_girar = StyledButton("Girar", primary=False, size_hint_x=None, width=dp(96))
-        btn_fechar = StyledButton("Fechar", primary=False, size_hint_x=None, width=dp(96))
+        btn_fechar = StyledButton("Fechar", primary=False)
         botoes.add_widget(btn_capturar)
-        botoes.add_widget(btn_girar)
         botoes.add_widget(btn_fechar)
         layout.add_widget(botoes)
-
         popup = Popup(title="Foto - vista superior", content=layout, size_hint=(0.94, 0.94))
-
-        def girar_preview(*_):
-            novo_angulo = preview.rotate_right()
-            self.set_status(f"Preview da câmera girado para {novo_angulo}°. Se a imagem estiver correta, clique em Salvar foto.")
 
         def capturar(*_):
             try:
@@ -1501,36 +1550,42 @@ class ChecklistScreen(BaseScreen):
                     texture = camera.texture
                     if texture is None:
                         raise RuntimeError("Câmera ainda não carregou a imagem. Aguarde 1 segundo e tente novamente.")
-
                     size = texture.size
                     pixels = texture.pixels
-
-                    from PIL import Image, ImageOps
+                    from PIL import Image
                     img = Image.frombytes("RGBA", size, pixels)
-
-                    # Corrige orientação da imagem salva seguindo o preview atual.
-                    rot = int(preview.rotation_angle or FOTO_ROTATION or 0) % 360
+                    try:
+                        rot = int(os.getenv("FOTO_ROTATION", "270"))
+                    except Exception:
+                        rot = 270
                     if rot:
                         img = img.rotate(rot, expand=True)
-
-                    # O Android/Kivy pode entregar a textura invertida dependendo do provider.
-                    # Mantemos desligado por padrão, mas é possível ativar via teste.env se algum tablet precisar.
                     if os.getenv("FOTO_FLIP_VERTICAL", "0") == "1":
-                        img = ImageOps.flip(img)
+                        img = img.transpose(Image.FLIP_TOP_BOTTOM)
                     if os.getenv("FOTO_FLIP_HORIZONTAL", "0") == "1":
-                        img = ImageOps.mirror(img)
-
-                    img.save(str(arquivo), format="PNG")
+                        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+                    img.save(str(arquivo), format="JPEG", quality=95)
                 except Exception:
-                    # Fallback seguro: se a textura falhar, salva pelo método nativo do Kivy.
-                    camera.export_to_png(str(arquivo))
+                    # Fallback: exporta do Kivy e normaliza depois.
+                    tmp_png = str(arquivo).replace(".jpg", ".png")
+                    camera.export_to_png(tmp_png)
+                    try:
+                        from PIL import Image
+                        img = Image.open(tmp_png).convert("RGB")
+                        img.save(str(arquivo), format="JPEG", quality=95)
+                        try:
+                            Path(tmp_png).unlink()
+                        except Exception:
+                            pass
+                    except Exception:
+                        arquivo = Path(tmp_png)
 
                 camera.play = False
                 self.foto_local_path = str(arquivo)
-
                 if self.lbl_foto:
                     self.lbl_foto.text = f"Foto salva localmente\n{arquivo}"
-
                 self.set_status(f"Foto salva no tablet: {arquivo.name}")
                 popup.dismiss()
             except Exception as e:
@@ -1544,11 +1599,9 @@ class ChecklistScreen(BaseScreen):
             popup.dismiss()
 
         btn_capturar.bind(on_release=capturar)
-        btn_girar.bind(on_release=girar_preview)
         btn_fechar.bind(on_release=fechar)
         popup.bind(on_dismiss=lambda *_: setattr(camera, "play", False))
         popup.open()
-
     def salvar(self):
         if self.busy:
             return
