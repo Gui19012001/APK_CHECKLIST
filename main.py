@@ -1,4 +1,4 @@
-# APK CHECKLIST DE QUALIDADE - MANGA / PNM / MOLA
+# APK CHECKLIST DE QUALIDADE - MANGA / PNM / MOLA / EIXO
 # Mantém a lógica do Streamlit: busca apontamentos do dia por linha, remove os já inspecionados,
 # mostra pendentes em ordem e salva o checklist no Supabase.
 
@@ -148,11 +148,29 @@ def _fmt_data_local(valor):
 
 
 def _inicio_fim_hoje_utc():
-    agora_local = datetime.datetime.now(TZ)
-    inicio_local = datetime.datetime(agora_local.year, agora_local.month, agora_local.day, 0, 0, 0, tzinfo=TZ)
-    fim_local = inicio_local + datetime.timedelta(days=1)
-    return inicio_local.astimezone(datetime.timezone.utc).isoformat(), fim_local.astimezone(datetime.timezone.utc).isoformat()
+    """
+    Janela operacional da produção: 06:00 até 02:00 do dia seguinte.
 
+    Exemplos:
+    - 2026-05-04 14:00 -> 2026-05-04 06:00 até 2026-05-05 02:00
+    - 2026-05-05 01:30 -> 2026-05-04 06:00 até 2026-05-05 02:00
+    - 2026-05-05 03:00 -> 2026-05-05 06:00 até 2026-05-06 02:00
+      (janela ainda futura, então normalmente a lista fica vazia até iniciar o turno)
+    """
+    agora_local = datetime.datetime.now(TZ)
+
+    if agora_local.time() < datetime.time(2, 0):
+        data_base = agora_local.date() - datetime.timedelta(days=1)
+    else:
+        data_base = agora_local.date()
+
+    inicio_local = datetime.datetime.combine(data_base, datetime.time(6, 0)).replace(tzinfo=TZ)
+    fim_local = datetime.datetime.combine(data_base + datetime.timedelta(days=1), datetime.time(2, 0)).replace(tzinfo=TZ)
+
+    return (
+        inicio_local.astimezone(datetime.timezone.utc).isoformat(),
+        fim_local.astimezone(datetime.timezone.utc).isoformat(),
+    )
 
 def status_emoji_para_texto(emoji):
     return {"✅": "Conforme", "❌": "Não Conforme", "🟡": "N/A"}.get(emoji, "")
@@ -609,6 +627,33 @@ def supabase_get(table_name: str, params: dict):
     return resp.json()
 
 
+def _sem_limit_offset(params):
+    return [(k, v) for k, v in list(params or []) if k not in {"limit", "offset"}]
+
+
+def supabase_get_all(table_name: str, params, page_size=1000, max_pages=80):
+    """
+    Busca paginada no PostgREST/Supabase.
+
+    Motivo: cada checklist salva várias linhas. Quando a busca vinha limitada,
+    os primeiros checklists do turno podiam ficar fora do retorno e voltavam
+    a aparecer como PENDENTE mesmo já estando salvos.
+    """
+    todos = []
+    base_params = _sem_limit_offset(params)
+
+    for page in range(max_pages):
+        offset = page * page_size
+        page_params = list(base_params) + [("limit", str(page_size)), ("offset", str(offset))]
+        dados = supabase_get(table_name, page_params)
+        if not dados:
+            break
+        todos.extend(dados)
+        if len(dados) < page_size:
+            break
+
+    return todos
+
 def supabase_post(table_name: str, payload):
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("SUPABASE_URL / SUPABASE_KEY não encontrados no teste.env")
@@ -680,6 +725,38 @@ ITEM_KEYS_MOLA = {
 }
 ITENS_OBS_OBRIGATORIA_MOLA = {3, 4, 5, 6, 7, 8}
 
+PERGUNTAS_EIXO = [
+    "Etiqueta do produto – As informações estão corretas / legíveis conforme modelo e gravação do eixo?",
+    "Placa do Inmetro está correta / fixada e legível? Número corresponde à viga? Gravação do número de série da viga está legível e pintada?",
+    "Etiqueta do ABS está conforme? Com número de série compatível ao da viga? Teste do ABS está aprovado?",
+    "Rodagem – tipo correto? Especifique o modelo",
+    "Graxeiras e Anéis elásticos estão em perfeito estado?",
+    "Sistema de atuação correto? Springs ou cuícas em perfeitas condições? Especifique o modelo:",
+    "Catraca do freio correta? Especifique modelo",
+    "Tampa do cubo correta, livre de avarias e pintura nos critérios? As tampas dos cubos dos ambos os lados são iguais?",
+    "Pintura do eixo livre de oxidação, isento de escorrimento na pintura, pontos sem tinta e camada conforme padrão?",
+    "Os cordões de solda do eixo estão conformes?",
+]
+ITEM_KEYS_EIXO = {
+    1: "ETIQUETA",
+    2: "PLACA_IMETRO E NÚMERO DE SÉRIE",
+    3: "TESTE_ABS",
+    4: "RODAGEM_MODELO",
+    5: "GRAXEIRAS E ANÉIS ELÁSTICOS",
+    6: "SISTEMA_ATUACAO",
+    7: "CATRACA_FREIO",
+    8: "TAMPA_CUBO",
+    9: "PINTURA_EIXO",
+    10: "SOLDA",
+}
+OPCOES_MODELOS_EIXO = {
+    4: ["", "Single", "Aço", "Alumínio", "N/A"],
+    6: ["", "Spring", "Cuíca", "N/A"],
+    7: ["", "Automático", "Manual", "N/A"],
+    10: ["", "Conforme", "Respingo", "Falta de cordão", "Porosidade", "Falta de Fusão"],
+}
+ITENS_OBS_OBRIGATORIA_EIXO = {4, 6, 7, 10}
+
 def is_mola(tipo_producao):
     return _normaliza_codigo(tipo_producao).upper() == "MOLA"
 
@@ -691,56 +768,119 @@ def linha_atual_app():
         return "MANGA_PNM"
 
 
+def is_eixo(tipo_producao):
+    tipo = _normaliza_codigo(tipo_producao).upper()
+    return tipo in {"EIXO", "EIXOS"}
+
+
 def perguntas_por_tipo(tipo_producao):
     tipo = _normaliza_codigo(tipo_producao).upper()
     if tipo == "MOLA":
         return list(PERGUNTAS_MOLA)
+    if is_eixo(tipo):
+        return list(PERGUNTAS_EIXO)
     perguntas = list(PERGUNTAS_MANGA_PNM_BASE)
     if tipo == "MANGA":
         perguntas.append("Grau do Manga conforme etiqueta do produto? Escreva qual o Grau:")
     return perguntas
 
+
 def item_keys_por_tipo(tipo_producao):
-    return ITEM_KEYS_MOLA if is_mola(tipo_producao) else ITEM_KEYS_MANGA_PNM
+    tipo = _normaliza_codigo(tipo_producao).upper()
+    if tipo == "MOLA":
+        return ITEM_KEYS_MOLA
+    if is_eixo(tipo):
+        return ITEM_KEYS_EIXO
+    return ITEM_KEYS_MANGA_PNM
+
 
 def tabela_checklist_por_tipo(tipo_producao):
-    return "checklists_mola_detalhes" if is_mola(tipo_producao) else "checklists_manga_pnm_detalhes"
+    tipo = _normaliza_codigo(tipo_producao).upper()
+    if tipo == "MOLA":
+        return "checklists_mola_detalhes"
+    if is_eixo(tipo):
+        return "checklists"
+    return "checklists_manga_pnm_detalhes"
+
 
 def carregar_apontamentos_hoje(limit=500, linha=None):
     linha = _normaliza_codigo(linha or linha_atual_app()).upper()
     inicio_utc, fim_utc = _inicio_fim_hoje_utc()
+
     if linha == "MOLA":
-        params = [("select", "id,numero_serie,op,usuario,data_hora"), ("data_hora", f"gte.{inicio_utc}"), ("data_hora", f"lt.{fim_utc}"), ("order", "data_hora.asc"), ("limit", str(limit))]
-        dados = supabase_get("apontamentos_mola", params)
+        params = [
+            ("select", "id,numero_serie,op,usuario,data_hora"),
+            ("data_hora", f"gte.{inicio_utc}"),
+            ("data_hora", f"lt.{fim_utc}"),
+            ("order", "data_hora.asc"),
+        ]
+        dados = supabase_get_all("apontamentos_mola", params, page_size=1000)
         for row in dados or []:
             row["tipo_producao"] = "MOLA"
         return dados
-    params = [("select", "id,numero_serie,op,tipo_producao,usuario,data_hora"), ("data_hora", f"gte.{inicio_utc}"), ("data_hora", f"lt.{fim_utc}"), ("order", "data_hora.asc"), ("limit", str(limit))]
-    return supabase_get("apontamentos_manga_pnm", params)
+
+    if linha == "EIXO":
+        params = [
+            ("select", "id,numero_serie,op,tipo_producao,data_hora"),
+            ("data_hora", f"gte.{inicio_utc}"),
+            ("data_hora", f"lt.{fim_utc}"),
+            ("order", "data_hora.asc"),
+        ]
+        dados = supabase_get_all("apontamentos", params, page_size=1000)
+        filtrados = []
+        for row in dados or []:
+            tipo_row = _normaliza_codigo(row.get("tipo_producao")).upper()
+            if "EIXO" in tipo_row:
+                row["tipo_producao"] = "EIXO"
+                row.setdefault("usuario", "")
+                filtrados.append(row)
+        return filtrados
+
+    params = [
+        ("select", "id,numero_serie,op,tipo_producao,usuario,data_hora"),
+        ("data_hora", f"gte.{inicio_utc}"),
+        ("data_hora", f"lt.{fim_utc}"),
+        ("order", "data_hora.asc"),
+    ]
+    return supabase_get_all("apontamentos_manga_pnm", params, page_size=1000)
 
 def carregar_checklists_existentes(linha=None, limit=5000):
     linha = _normaliza_codigo(linha or linha_atual_app()).upper()
     inicio_utc, fim_utc = _inicio_fim_hoje_utc()
+
     if linha == "MOLA":
-        return supabase_get(
+        return supabase_get_all(
             "checklists_mola_detalhes",
             [
                 ("select", "numero_serie,data_hora"),
                 ("data_hora", f"gte.{inicio_utc}"),
                 ("data_hora", f"lt.{fim_utc}"),
                 ("order", "data_hora.desc"),
-                ("limit", str(limit)),
             ],
+            page_size=1000,
         )
-    return supabase_get(
+
+    if linha == "EIXO":
+        return supabase_get_all(
+            "checklists",
+            [
+                ("select", "numero_serie,data_hora,reinspecao"),
+                ("data_hora", f"gte.{inicio_utc}"),
+                ("data_hora", f"lt.{fim_utc}"),
+                ("order", "data_hora.desc"),
+            ],
+            page_size=1000,
+        )
+
+    return supabase_get_all(
         "checklists_manga_pnm_detalhes",
         [
             ("select", "numero_serie,tipo_producao,data_hora"),
             ("data_hora", f"gte.{inicio_utc}"),
             ("data_hora", f"lt.{fim_utc}"),
             ("order", "data_hora.desc"),
-            ("limit", str(limit)),
         ],
+        page_size=1000,
     )
 
 def carregar_pendentes_inspecao(linha=None):
@@ -748,9 +888,10 @@ def carregar_pendentes_inspecao(linha=None):
     return [item for item in carregar_itens_inspecao_dia(linha=linha) if not item.get("inspecionado")]
 
 
+
 def carregar_itens_inspecao_dia(linha=None):
     """
-    Retorna TODOS os apontamentos do dia na ordem de produção.
+    Retorna TODOS os apontamentos da janela operacional 06:00-02:00 na ordem de produção.
     - Itens ainda sem checklist: inspecionado=False e mostram botão Inspecionar.
     - Itens já salvos no Supabase: inspecionado=True e mostram OK, sem botão.
     """
@@ -761,7 +902,12 @@ def carregar_itens_inspecao_dia(linha=None):
     feitos = set()
     for row in checklists or []:
         serie = _normaliza_codigo(row.get("numero_serie"))
-        tipo = "MOLA" if linha == "MOLA" else _normaliza_codigo(row.get("tipo_producao")).upper()
+        if linha == "MOLA":
+            tipo = "MOLA"
+        elif linha == "EIXO":
+            tipo = "EIXO"
+        else:
+            tipo = _normaliza_codigo(row.get("tipo_producao")).upper()
         if serie:
             feitos.add((serie, tipo))
 
@@ -769,7 +915,12 @@ def carregar_itens_inspecao_dia(linha=None):
     vistos = set()
     for row in apontamentos or []:
         serie = _normaliza_codigo(row.get("numero_serie"))
-        tipo = "MOLA" if linha == "MOLA" else _normaliza_codigo(row.get("tipo_producao")).upper()
+        if linha == "MOLA":
+            tipo = "MOLA"
+        elif linha == "EIXO":
+            tipo = "EIXO"
+        else:
+            tipo = _normaliza_codigo(row.get("tipo_producao")).upper()
         if not serie:
             continue
         chave = (serie, tipo)
@@ -789,6 +940,7 @@ def carregar_itens_inspecao_dia(linha=None):
     return itens
 
 
+
 def salvar_checklist_supabase(item_apontamento, respostas, complementos, usuario):
     numero_serie = _normaliza_codigo(item_apontamento.get("numero_serie"))
     tipo_producao = _normaliza_codigo(item_apontamento.get("tipo_producao")).upper()
@@ -797,6 +949,25 @@ def salvar_checklist_supabase(item_apontamento, respostas, complementos, usuario
     perguntas = perguntas_por_tipo(tipo_producao)
     keys = item_keys_por_tipo(tipo_producao)
     registros = []
+
+    if is_eixo(tipo_producao):
+        reprovado = any(status_emoji_para_texto(respostas.get(idx)) == "Não Conforme" for idx in range(1, len(perguntas) + 1))
+        for idx, _pergunta in enumerate(perguntas, start=1):
+            emoji = respostas.get(idx)
+            item_final = keys.get(idx, f"ITEM_{idx}")
+            comp = normalizar_texto(complementos.get(idx, ""))
+            registros.append({
+                "numero_serie": numero_serie,
+                "item": item_final,
+                "status": status_emoji_para_texto(emoji),
+                "observacoes": comp or "",
+                "inspetor": usuario,
+                "data_hora": _agora_utc_iso(),
+                "produto_reprovado": "Sim" if reprovado else "Não",
+                "reinspecao": "Não",
+            })
+        return supabase_post("checklists", registros)
+
     for idx, _pergunta in enumerate(perguntas, start=1):
         emoji = respostas.get(idx)
         item_final = keys.get(idx, f"ITEM_{idx}")
@@ -809,11 +980,16 @@ def salvar_checklist_supabase(item_apontamento, respostas, complementos, usuario
             registros.append({"numero_serie": numero_serie, "tipo_producao": tipo_producao, "item": item_final, "status": status_emoji_para_texto(emoji), "usuario": usuario, "data_hora": _agora_utc_iso()})
     return supabase_post(tabela_checklist_por_tipo(tipo_producao), registros)
 
+
 def complemento_config(tipo_producao, idx):
     tipo = _normaliza_codigo(tipo_producao).upper()
     if tipo == "MOLA":
         if idx in ITENS_OBS_OBRIGATORIA_MOLA:
             return "texto", None, "Obrigatório: informe valor / tipo / dimensão."
+        return "", None, ""
+    if is_eixo(tipo):
+        if idx in OPCOES_MODELOS_EIXO:
+            return "spinner", OPCOES_MODELOS_EIXO[idx], "Selecione o modelo quando aplicável."
         return "", None, ""
     if idx in OPCOES_MODELOS_MANGA_PNM:
         return "spinner", OPCOES_MODELOS_MANGA_PNM[idx], "Selecione o modelo quando aplicável."
@@ -893,16 +1069,37 @@ class StyledButton(Button):
 
 class StyledInput(TextInput):
     def __init__(self, hint="", navy=False, **kwargs):
+        # Correção importante para Android:
+        # A versão anterior escondia o texto real do TextInput e desenhava um
+        # "espelho" por cima. Em alguns teclados Android isso fazia os campos
+        # de complemento reaproveitarem/duplicarem textos digitados em outros
+        # itens. Agora o TextInput usa o texto nativo visível, mantendo o mesmo
+        # visual de borda/fundo, mas sem sobreposição de texto.
         kwargs.setdefault("input_type", "text")
-        kwargs.setdefault("keyboard_suggestions", True)
-        self._navy = navy
-        self._radius = 16
-        self._texture = make_vertical_gradient_texture(FIELD_TOP, FIELD_BOTTOM)
-        self._display_pad_x = dp(14)
+        kwargs.setdefault("keyboard_suggestions", False)
         kwargs.setdefault("size_hint_y", None)
         kwargs.setdefault("height", dp(46))
         kwargs.setdefault("padding", [dp(14), dp(12), dp(14), dp(12)])
-        super().__init__(multiline=False, hint_text=hint, foreground_color=(1, 1, 1, 0), disabled_foreground_color=(1, 1, 1, 0), hint_text_color=(1, 1, 1, 0), cursor_color=(1, 1, 1, 1) if navy else (0, 0, 0, 1), selection_color=(1, 1, 1, 0.25) if navy else (0.2, 0.4, 0.8, 0.35), background_color=(0, 0, 0, 0), background_normal="", background_active="", write_tab=False, **kwargs)
+
+        self._navy = navy
+        self._radius = 16
+        self._texture = make_vertical_gradient_texture(FIELD_TOP, FIELD_BOTTOM)
+
+        super().__init__(
+            multiline=False,
+            hint_text=hint,
+            foreground_color=TEXT_LIGHT if navy else TEXT_DARK,
+            disabled_foreground_color=(1, 1, 1, 0.85) if navy else TEXT_MUTED,
+            hint_text_color=(0.92, 0.96, 1, 1) if navy else TEXT_MUTED,
+            cursor_color=(1, 1, 1, 1) if navy else (0, 0, 0, 1),
+            selection_color=(1, 1, 1, 0.25) if navy else (0.2, 0.4, 0.8, 0.35),
+            background_color=(0, 0, 0, 0),
+            background_normal="",
+            background_active="",
+            write_tab=False,
+            **kwargs,
+        )
+
         with self.canvas.before:
             if self._navy:
                 self._fill_color = Color(1, 1, 1, 1)
@@ -913,44 +1110,73 @@ class StyledInput(TextInput):
                 self._fill_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius] * 4)
                 self._border_color = Color(*CARD_BORDER)
             self._border_line = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, self._radius), width=1.15)
-        with self.canvas.after:
-            self._mirror_color = Color(1, 1, 1, 1)
-            self._mirror_rect = RoundedRectangle(pos=self.pos, size=(0, 0))
+
         self.bind(pos=self._update_bg, size=self._update_bg)
-        self.bind(text=self._update_mirror_text)
-        self.bind(hint_text=self._update_mirror_text)
-        Clock.schedule_once(self._update_mirror_text, 0)
 
     def _update_bg(self, *_):
         self._fill_rect.pos = self.pos
         self._fill_rect.size = self.size
         self._border_line.rounded_rectangle = (self.x, self.y, self.width, self.height, self._radius)
-        self._update_mirror_text()
 
-    def _mirror_value(self):
-        txt = self.text or ""
-        if txt:
-            return txt, ((1, 1, 1, 1) if self._navy else (0, 0, 0, 1))
-        return self.hint_text or "", ((1, 1, 1, 0.92) if self._navy else TEXT_MUTED)
 
-    def _update_mirror_text(self, *_):
-        txt, color = self._mirror_value()
-        self._mirror_color.rgba = color
-        if not txt:
-            self._mirror_rect.texture = None
-            self._mirror_rect.size = (0, 0)
-            return
-        label = CoreLabel(text=txt, font_size=self.font_size, color=color)
-        label.refresh()
-        texture = label.texture
-        self._mirror_rect.texture = texture
-        self._mirror_rect.pos = (self.x + self._display_pad_x, self.center_y - texture.height / 2)
-        self._mirror_rect.size = texture.size
+class LoginStyledInput(StyledInput):
+    """
+    Campo usado somente na tela inicial.
+    Mantém o visual azul do app, mas desenha o texto/hint em branco por cima.
+    Isso evita o texto azul/baixo contraste no login sem voltar com o bug de duplicação
+    dos campos do checklist, porque os campos das perguntas continuam usando StyledInput normal.
+    """
+    def __init__(self, hint="", **kwargs):
+        kwargs.setdefault("navy", True)
+        super().__init__(hint, **kwargs)
+
+        # Esconde o texto nativo apenas nesta tela e desenha uma camada branca controlada.
+        self.foreground_color = (1, 1, 1, 0)
+        self.disabled_foreground_color = (1, 1, 1, 0)
+        self.hint_text_color = (1, 1, 1, 0)
+        self._login_pad_x = dp(14)
+
+        with self.canvas.after:
+            self._login_text_color = Color(1, 1, 1, 1)
+            self._login_text_rect = RoundedRectangle(pos=self.pos, size=(0, 0), radius=[0, 0, 0, 0])
+
+        self.bind(text=self._update_login_text)
+        self.bind(hint_text=self._update_login_text)
+        self.bind(pos=self._update_login_text)
+        self.bind(size=self._update_login_text)
+        self.bind(focus=self._update_login_text)
+        Clock.schedule_once(self._update_login_text, 0)
+
+    def _texto_visivel_login(self):
+        if self.text:
+            if getattr(self, "password", False):
+                return "*" * len(self.text), (1, 1, 1, 1)
+            return self.text, (1, 1, 1, 1)
+        return self.hint_text or "", (1, 1, 1, 0.92)
+
+    def _update_login_text(self, *_):
+        try:
+            txt, color = self._texto_visivel_login()
+            self._login_text_color.rgba = color
+            if not txt:
+                self._login_text_rect.texture = None
+                self._login_text_rect.size = (0, 0)
+                return
+
+            label = CoreLabel(text=txt, font_size=self.font_size, color=color)
+            label.refresh()
+            texture = label.texture
+            self._login_text_rect.texture = texture
+            self._login_text_rect.pos = (self.x + self._login_pad_x, self.center_y - texture.height / 2)
+            self._login_text_rect.size = texture.size
+        except Exception:
+            pass
 
 
 class StyledSpinner(Spinner):
     def __init__(self, navy=False, **kwargs):
         super().__init__(background_normal="", background_down="", background_color=(0, 0, 0, 0), color=TEXT_LIGHT if navy else TEXT_DARK, **kwargs)
+        self.bold = True if navy else False
         self._radius = 16
         self._texture = make_vertical_gradient_texture(FIELD_TOP, FIELD_BOTTOM)
         with self.canvas.before:
@@ -1080,43 +1306,66 @@ class QuestionCard(Card):
 
 
 
+def login_form_label(text):
+    lbl = Label(
+        text=text,
+        color=TEXT_DARK,
+        halign="left",
+        valign="middle",
+        size_hint_y=None,
+        height=dp(22),
+    )
+    lbl.bind(size=lambda inst, val: setattr(inst, "text_size", val))
+    return lbl
+
 class LoginScreen(BaseScreen):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        outer = BoxLayout(orientation="vertical", padding=dp(24), spacing=dp(16))
+        outer = BoxLayout(orientation="vertical", padding=dp(18), spacing=dp(10))
         self.add_widget(outer)
-        outer.add_widget(Label(size_hint_y=0.12))
-        wrap = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(350))
+        outer.add_widget(Label(size_hint_y=None, height=dp(10)))
+        wrap = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(690))
         outer.add_widget(wrap)
-        wrap.add_widget(Label(size_hint_x=0.14))
-        center_col = BoxLayout(orientation="vertical", size_hint_x=0.72, spacing=dp(14))
+        wrap.add_widget(Label(size_hint_x=0.10))
+        center_col = BoxLayout(orientation="vertical", size_hint_x=0.80, spacing=dp(14))
         wrap.add_widget(center_col)
-        wrap.add_widget(Label(size_hint_x=0.14))
+        wrap.add_widget(Label(size_hint_x=0.10))
         header = GradientCard(orientation="vertical", size_hint_y=None, height=dp(120), padding=dp(18), spacing=dp(4))
         center_col.add_widget(header)
-        header.add_widget(Label(text="Checklist de Qualidade", font_size="28sp", color=TEXT_LIGHT))
-        header.add_widget(Label(text="MANGA / PNM / MOLA", font_size="16sp", color=(0.86, 0.92, 0.98, 1)))
-        form = Card(orientation="vertical", padding=dp(18), spacing=dp(12), size_hint_y=None, height=dp(380))
+        header.add_widget(Label(text="Checklist de Qualidade", font_size="28sp", color=TEXT_LIGHT, bold=True))
+        header.add_widget(Label(text="MANGA / PNM / MOLA / EIXO", font_size="16sp", color=(0.92, 0.96, 1, 1), bold=True))
+        form = Card(orientation="vertical", padding=dp(18), spacing=dp(12), size_hint_y=None, height=dp(540))
         center_col.add_widget(form)
-        form.add_widget(Label(text="Linha", color=TEXT_DARK, halign="left", size_hint_y=None, height=dp(22)))
-        self.linha = StyledSpinner(text="MANGA_PNM", values=["MANGA_PNM", "MOLA"], size_hint_y=None, height=dp(46), navy=True)
-        form.add_widget(self.linha)
-        form.add_widget(Label(text="Usuário", color=TEXT_DARK, halign="left", size_hint_y=None, height=dp(22)))
-        self.usuario = StyledInput("Usuário / Inspetor", input_type="text", keyboard_suggestions=True, navy=True)
-        self.usuario.text = "Operador_Logado"
-        form.add_widget(self.usuario)
+        cfg_login = carregar_config_local()
+        ultima_linha = normalizar_texto(cfg_login.get("ultima_linha", "MANGA_PNM")).upper() or "MANGA_PNM"
+        if ultima_linha not in ["MANGA_PNM", "MOLA", "EIXO"]:
+            ultima_linha = "MANGA_PNM"
+        ultimo_usuario = normalizar_texto(cfg_login.get("ultimo_usuario", "Operador_Logado")) or "Operador_Logado"
 
-        form.add_widget(Label(text="Pasta padrão para fotos e PDFs", color=TEXT_DARK, halign="left", size_hint_y=None, height=dp(22)))
+        form.add_widget(login_form_label("Linha"))
+        self.linha = StyledSpinner(text=ultima_linha, values=["MANGA_PNM", "MOLA", "EIXO"], size_hint_y=None, height=dp(46), navy=True)
+        form.add_widget(self.linha)
+        form.add_widget(login_form_label("Usuário"))
+        self.usuario = LoginStyledInput("Usuário / Inspetor", input_type="text", keyboard_suggestions=False)
+        self.usuario.text = ultimo_usuario
+        form.add_widget(self.usuario)
+        form.add_widget(login_form_label("Senha"))
+        self.senha = LoginStyledInput("Senha padrão", input_type="number", keyboard_suggestions=False, password=True)
+        self.senha.text = ""
+        form.add_widget(self.senha)
+
+        form.add_widget(login_form_label("Pasta padrão para fotos e PDFs"))
         pasta_row = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(46))
-        self.pasta_padrao = StyledInput("Ex.: C:\\Checklists ou /storage/emulated/0/Documents/Checklists", input_type="text", keyboard_suggestions=True, navy=True)
-        self.pasta_padrao.text = carregar_config_local().get("pasta_padrao", "") or str(pasta_base_documentos())
+        self.pasta_padrao = LoginStyledInput("Ex.: C:\\Checklists ou /storage/emulated/0/Documents/Checklists", input_type="text", keyboard_suggestions=False)
+        self.pasta_padrao.text = cfg_login.get("pasta_padrao", "") or str(pasta_base_documentos())
         btn_pasta = StyledButton("Escolher", primary=False, size_hint_x=None, width=dp(110), height=dp(46))
         btn_pasta.bind(on_release=lambda *_: self.escolher_pasta())
         pasta_row.add_widget(self.pasta_padrao)
         pasta_row.add_widget(btn_pasta)
         form.add_widget(pasta_row)
 
-        self.status = Label(text="", size_hint_y=None, height=dp(24), color=WARNING)
+        self.status = Label(text="", size_hint_y=None, height=dp(34), color=WARNING, halign="left", valign="middle")
+        self.status.bind(size=lambda inst, val: setattr(inst, "text_size", val))
         form.add_widget(self.status)
         btn = StyledButton("Entrar", primary=True)
         btn.bind(on_release=lambda *_: self.entrar())
@@ -1125,11 +1374,19 @@ class LoginScreen(BaseScreen):
 
     def on_pre_enter(self, *args):
         Window.softinput_mode = "below_target"
+        cfg_login = carregar_config_local()
+        ultima_linha = normalizar_texto(cfg_login.get("ultima_linha", self.linha.text or "MANGA_PNM")).upper() or "MANGA_PNM"
+        if ultima_linha in ["MANGA_PNM", "MOLA", "EIXO"]:
+            self.linha.text = ultima_linha
+        ultimo_usuario = normalizar_texto(cfg_login.get("ultimo_usuario", self.usuario.text or "Operador_Logado")) or "Operador_Logado"
+        self.usuario.text = ultimo_usuario
+        if cfg_login.get("pasta_padrao"):
+            self.pasta_padrao.text = cfg_login.get("pasta_padrao")
+        self.senha.text = ""
         Clock.schedule_once(lambda dt: self.force_focus_login(), 0.15)
 
     def force_focus_login(self):
-        self.usuario.focus = True
-        self.usuario.select_all()
+        self.senha.focus = True
 
     def show_status(self, msg):
         self.status.text = msg
@@ -1170,11 +1427,24 @@ class LoginScreen(BaseScreen):
         self.status.text = f"Pasta padrão definida no app\n{caminho}"
 
     def entrar(self):
+        senha_digitada = normalizar_texto(self.senha.text)
+        if senha_digitada != "123456":
+            self.status.text = "Senha inválida. Use a senha padrão 123456."
+            self.senha.text = ""
+            self.senha.focus = True
+            return
+
         app = App.get_running_app()
         app.usuario = normalizar_texto(self.usuario.text) or "Operador_Logado"
         app.linha = normalizar_texto(self.linha.text).upper() or "MANGA_PNM"
         app.pasta_padrao = normalizar_texto(self.pasta_padrao.text)
-        salvar_config_local({"pasta_padrao": app.pasta_padrao})
+        salvar_config_local({
+            "pasta_padrao": app.pasta_padrao,
+            "ultimo_usuario": app.usuario,
+            "ultima_linha": app.linha,
+        })
+        self.status.text = ""
+        self.senha.text = ""
         app.register_activity()
         self.manager.current = "pendentes"
 
@@ -1218,6 +1488,14 @@ class PendentesScreen(BaseScreen):
 
     def logout(self):
         app = App.get_running_app()
+        cfg = carregar_config_local()
+        if app.usuario:
+            cfg["ultimo_usuario"] = app.usuario
+        if app.linha:
+            cfg["ultima_linha"] = app.linha
+        if app.pasta_padrao:
+            cfg["pasta_padrao"] = app.pasta_padrao
+        salvar_config_local(cfg)
         app.usuario = ""
         self.manager.current = "login"
 
@@ -1228,7 +1506,7 @@ class PendentesScreen(BaseScreen):
         if self.busy:
             return
         self.busy = True
-        self.set_status(f"Buscando apontamentos de produção do dia na linha {App.get_running_app().linha}...")
+        self.set_status(f"Buscando apontamentos da janela 06:00-02:00 na linha {App.get_running_app().linha}...")
         self.pendentes_box.clear_widgets()
         threading.Thread(target=self._worker_refresh, daemon=True).start()
 
@@ -1250,18 +1528,20 @@ class PendentesScreen(BaseScreen):
         self.pendentes_box.clear_widgets()
 
         if not itens:
-            self.set_status("Nenhum apontamento de produção encontrado hoje para esta linha.")
+            self.set_status("Nenhum apontamento encontrado na janela 06:00-02:00 para esta linha.")
             return
 
         pendentes = [x for x in itens if not x.get("inspecionado")]
         feitos = [x for x in itens if x.get("inspecionado")]
 
         if pendentes:
-            self.set_status(f"{len(pendentes)} pendente(s) de inspeção. {len(feitos)} já inspecionado(s) hoje.")
+            self.set_status(f"{len(pendentes)} pendente(s) de inspeção. {len(feitos)} já inspecionado(s) na janela.")
         else:
-            self.set_status(f"✅ Todos os {len(itens)} apontamento(s) de hoje já têm checklist salvo.")
+            self.set_status(f"✅ Todos os {len(itens)} apontamento(s) da janela já têm checklist salvo.")
 
-        for item in itens:
+        itens_ordenados = pendentes + feitos
+
+        for item in itens_ordenados:
             inspecionado = bool(item.get("inspecionado"))
             card = Card(orientation="horizontal", padding=dp(12), spacing=dp(8), size_hint_y=None, height=dp(82))
             status_txt = "[color=339955][b]OK - INSPECIONADO[/b][/color]" if inspecionado else "[color=D88C00][b]PENDENTE[/b][/color]"
@@ -1667,6 +1947,13 @@ class ChecklistScreen(BaseScreen):
                 nomes = ", ".join(keys.get(i, str(i)) for i in faltam_obs)
                 self.set_status(f"⚠️ Preencha as observações obrigatórias da MOLA: {nomes}")
                 return
+        if is_eixo(tipo):
+            faltam_modelo = [idx for idx in ITENS_OBS_OBRIGATORIA_EIXO if not normalizar_texto(complementos.get(idx, ""))]
+            if faltam_modelo:
+                keys = item_keys_por_tipo(tipo)
+                nomes = ", ".join(keys.get(i, str(i)) for i in faltam_modelo)
+                self.set_status(f"⚠️ Preencha os modelos obrigatórios do EIXO: {nomes}")
+                return
         self.busy = True
         self.btn_salvar.disabled = True
         self.set_status("Salvando checklist, gerando PDF e sincronizando no Supabase...")
@@ -1722,7 +2009,10 @@ class ChecklistQualidadeApp(App):
 
     def build(self):
         self.title = "Checklist de Qualidade"
-        self.pasta_padrao = carregar_config_local().get("pasta_padrao", "")
+        cfg_login = carregar_config_local()
+        self.pasta_padrao = cfg_login.get("pasta_padrao", "")
+        self.usuario = normalizar_texto(cfg_login.get("ultimo_usuario", ""))
+        self.linha = normalizar_texto(cfg_login.get("ultima_linha", "MANGA_PNM")).upper() or "MANGA_PNM"
         Window.softinput_mode = "below_target"
         Window.bind(on_key_down=self._on_window_key_down)
         self.sm = ScreenManager()
@@ -1746,6 +2036,14 @@ class ChecklistQualidadeApp(App):
             self.force_logout("Sessão expirada após 30 minutos de inatividade.")
 
     def force_logout(self, msg="Sessão encerrada."):
+        cfg = carregar_config_local()
+        if self.usuario:
+            cfg["ultimo_usuario"] = self.usuario
+        if self.linha:
+            cfg["ultima_linha"] = self.linha
+        if self.pasta_padrao:
+            cfg["pasta_padrao"] = self.pasta_padrao
+        salvar_config_local(cfg)
         self.usuario = ""
         self.register_activity()
         if self.sm:
