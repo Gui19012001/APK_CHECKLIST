@@ -1,5 +1,5 @@
-# APK CHECKLIST DE QUALIDADE - MANGA / PNM / MOLA / EIXO
-# Mantém a lógica do Streamlit: busca apontamentos do dia por linha, remove os já inspecionados,
+# APK CHECKLIST DE REVISÃO - MANGA / PNM / MOLA / EIXO
+# Mantém a lógica do Streamlit: busca apontamentos do dia por linha, remove os já revisados,
 # mostra pendentes em ordem e salva o checklist no Supabase.
 
 import os
@@ -490,7 +490,7 @@ def gerar_pdf_checklist_local(item_apontamento, respostas, complementos, usuario
         y = margem
         if com_cabecalho:
             draw.rounded_rectangle((margem, y, W - margem, y + 82), radius=18, fill=header_blue)
-            draw.text((margem + 24, y + 22), _limpar_texto_pdf(f"Checklist de Qualidade - {tipo}"), font=font_title, fill="white")
+            draw.text((margem + 24, y + 22), _limpar_texto_pdf(f"Checklist de Revisão - {tipo}"), font=font_title, fill="white")
             y += 112
         pages.append(img)
         return img, draw, y
@@ -500,8 +500,8 @@ def gerar_pdf_checklist_local(item_apontamento, respostas, complementos, usuario
     # Resumo
     resumo = [
         ("Serie", numero_serie, "OP", op),
-        ("Tipo", tipo, "Inspetor", _normaliza_codigo(usuario) or "Operador_Logado"),
-        ("Inspecao", data_inspecao, "Apontamento", data_apontamento),
+        ("Tipo", tipo, "Revisor", _normaliza_codigo(usuario) or "Operador_Logado"),
+        ("Revisao", data_inspecao, "Apontamento", data_apontamento),
     ]
     colx = [margem, margem + 170, margem + 510, margem + 690]
     colw = [170, 340, 180, W - margem - (margem + 690)]
@@ -526,7 +526,7 @@ def gerar_pdf_checklist_local(item_apontamento, respostas, complementos, usuario
 
     def desenhar_cab_tabela(draw, y):
         draw.rectangle((margem, y, W - margem, y + 46), fill=header_blue)
-        heads = ["#", "Item inspecionado", "Resposta", "Complemento"]
+        heads = ["#", "Item revisado", "Resposta", "Complemento"]
         for i, head in enumerate(heads):
             draw.text((xs[i] + 10, y + 13), _limpar_texto_pdf(head), font=font_bold, fill="white")
             if i > 0:
@@ -884,7 +884,7 @@ def carregar_checklists_existentes(linha=None, limit=5000):
     )
 
 def carregar_pendentes_inspecao(linha=None):
-    """Mantido para compatibilidade: retorna somente itens ainda não inspecionados."""
+    """Mantido para compatibilidade: retorna somente itens ainda não revisados."""
     return [item for item in carregar_itens_inspecao_dia(linha=linha) if not item.get("inspecionado")]
 
 
@@ -892,8 +892,8 @@ def carregar_pendentes_inspecao(linha=None):
 def carregar_itens_inspecao_dia(linha=None):
     """
     Retorna TODOS os apontamentos da janela operacional 06:00-02:00 na ordem de produção.
-    - Itens ainda sem checklist: inspecionado=False e mostram botão Inspecionar.
-    - Itens já salvos no Supabase: inspecionado=True e mostram OK, sem botão.
+    - Itens ainda sem checklist: revisado=False e mostram botão Revisar.
+    - Itens já salvos no Supabase: revisado=True e mostram OK, sem botão.
     """
     linha = _normaliza_codigo(linha or linha_atual_app()).upper()
     apontamentos = carregar_apontamentos_hoje(linha=linha)
@@ -1332,7 +1332,7 @@ class LoginScreen(BaseScreen):
         wrap.add_widget(Label(size_hint_x=0.10))
         header = GradientCard(orientation="vertical", size_hint_y=None, height=dp(120), padding=dp(18), spacing=dp(4))
         center_col.add_widget(header)
-        header.add_widget(Label(text="Checklist de Qualidade", font_size="28sp", color=TEXT_LIGHT, bold=True))
+        header.add_widget(Label(text="Checklist de Revisão", font_size="28sp", color=TEXT_LIGHT, bold=True))
         header.add_widget(Label(text="MANGA / PNM / MOLA / EIXO", font_size="16sp", color=(0.92, 0.96, 1, 1), bold=True))
         form = Card(orientation="vertical", padding=dp(18), spacing=dp(12), size_hint_y=None, height=dp(540))
         center_col.add_widget(form)
@@ -1346,7 +1346,7 @@ class LoginScreen(BaseScreen):
         self.linha = StyledSpinner(text=ultima_linha, values=["MANGA_PNM", "MOLA", "EIXO"], size_hint_y=None, height=dp(46), navy=True)
         form.add_widget(self.linha)
         form.add_widget(login_form_label("Usuário"))
-        self.usuario = LoginStyledInput("Usuário / Inspetor", input_type="text", keyboard_suggestions=False)
+        self.usuario = LoginStyledInput("Usuário / Revisor", input_type="text", keyboard_suggestions=False)
         self.usuario.text = ultimo_usuario
         form.add_widget(self.usuario)
         form.add_widget(login_form_label("Senha"))
@@ -1458,7 +1458,7 @@ class PendentesScreen(BaseScreen):
         topo = GradientCard(orientation="horizontal", size_hint_y=None, height=dp(86), padding=dp(16), spacing=dp(8))
         outer.add_widget(topo)
         left = BoxLayout(orientation="vertical")
-        self.lbl_title = Label(text="Pendentes de Inspeção", font_size="24sp", color=TEXT_LIGHT, halign="left", valign="middle")
+        self.lbl_title = Label(text="Pendentes de Revisão", font_size="24sp", color=TEXT_LIGHT, halign="left", valign="middle")
         self.lbl_title.bind(size=lambda inst, val: setattr(inst, "text_size", val))
         self.lbl_user = Label(text="", font_size="13sp", color=(0.86, 0.92, 0.98, 1), halign="left", valign="middle")
         self.lbl_user.bind(size=lambda inst, val: setattr(inst, "text_size", val))
@@ -1483,7 +1483,7 @@ class PendentesScreen(BaseScreen):
 
     def on_pre_enter(self, *args):
         app = App.get_running_app()
-        self.lbl_user.text = f"Inspetor: {app.usuario or '-'} | Linha: {app.linha or '-'}"
+        self.lbl_user.text = f"Revisor: {app.usuario or '-'} | Linha: {app.linha or '-'}"
         self.refresh()
 
     def logout(self):
@@ -1535,16 +1535,16 @@ class PendentesScreen(BaseScreen):
         feitos = [x for x in itens if x.get("inspecionado")]
 
         if pendentes:
-            self.set_status(f"{len(pendentes)} pendente(s) de inspeção. {len(feitos)} já inspecionado(s) na janela.")
+            self.set_status(f"{len(pendentes)} pendente(s) de revisão. {len(feitos)} já revisado(s) na janela.")
         else:
             self.set_status(f"✅ Todos os {len(itens)} apontamento(s) da janela já têm checklist salvo.")
 
         itens_ordenados = pendentes + feitos
 
         for item in itens_ordenados:
-            inspecionado = bool(item.get("inspecionado"))
+            revisado = bool(item.get("inspecionado"))
             card = Card(orientation="horizontal", padding=dp(12), spacing=dp(8), size_hint_y=None, height=dp(82))
-            status_txt = "[color=339955][b]OK - INSPECIONADO[/b][/color]" if inspecionado else "[color=D88C00][b]PENDENTE[/b][/color]"
+            status_txt = "[color=339955][b]OK - REVISADO[/b][/color]" if revisado else "[color=D88C00][b]PENDENTE[/b][/color]"
             texto = (
                 f"[b]Série:[/b] {item.get('numero_serie')}   {status_txt}\n"
                 f"[b]OP:[/b] {item.get('op') or '-'}   [b]Tipo:[/b] {item.get('tipo_producao') or '-'}   [b]Hora:[/b] {item.get('data_fmt') or '-'}"
@@ -1553,12 +1553,12 @@ class PendentesScreen(BaseScreen):
             lbl.bind(size=lambda inst, val: setattr(inst, "text_size", val))
             card.add_widget(lbl)
 
-            if inspecionado:
+            if revisado:
                 ok = Label(text="OK", color=SUCCESS, bold=True, font_size="20sp", halign="center", valign="middle", size_hint_x=0.26)
                 ok.bind(size=lambda inst, val: setattr(inst, "text_size", val))
                 card.add_widget(ok)
             else:
-                btn = StyledButton("Inspecionar", primary=True, size_hint_x=0.26, height=dp(52))
+                btn = StyledButton("Revisar", primary=True, size_hint_x=0.26, height=dp(52))
                 btn.bind(on_release=lambda _, x=item: self.abrir_checklist(x))
                 card.add_widget(btn)
 
@@ -1584,7 +1584,7 @@ class ChecklistScreen(BaseScreen):
         topo = GradientCard(orientation="horizontal", size_hint_y=None, height=dp(94), padding=dp(16), spacing=dp(8))
         outer.add_widget(topo)
         left = BoxLayout(orientation="vertical")
-        self.lbl_title = Label(text="Checklist de Qualidade", font_size="22sp", color=TEXT_LIGHT, halign="left", valign="middle")
+        self.lbl_title = Label(text="Checklist de Revisão", font_size="22sp", color=TEXT_LIGHT, halign="left", valign="middle")
         self.lbl_title.bind(size=lambda inst, val: setattr(inst, "text_size", val))
         self.lbl_info = Label(text="", font_size="13sp", color=(0.86, 0.92, 0.98, 1), halign="left", valign="middle")
         self.lbl_info.bind(size=lambda inst, val: setattr(inst, "text_size", val))
@@ -1997,7 +1997,7 @@ class ChecklistScreen(BaseScreen):
         Clock.schedule_once(lambda dt: self.manager.get_screen("pendentes").refresh(), 0.2)
 
 
-class ChecklistQualidadeApp(App):
+class ChecklistRevisaoApp(App):
     usuario = StringProperty("")
     linha = StringProperty("MANGA_PNM")
     pasta_padrao = StringProperty("")
@@ -2008,7 +2008,7 @@ class ChecklistQualidadeApp(App):
         self.sm = None
 
     def build(self):
-        self.title = "Checklist de Qualidade"
+        self.title = "Checklist de Revisão"
         cfg_login = carregar_config_local()
         self.pasta_padrao = cfg_login.get("pasta_padrao", "")
         self.usuario = normalizar_texto(cfg_login.get("ultimo_usuario", ""))
@@ -2054,4 +2054,4 @@ class ChecklistQualidadeApp(App):
 
 
 if __name__ == "__main__":
-    ChecklistQualidadeApp().run()
+    ChecklistRevisaoApp().run()
