@@ -1900,21 +1900,25 @@ class ChecklistScreen(BaseScreen):
 
     def abrir_camera(self):
         """
-        Abre SEMPRE a câmera NATIVA/LOCAL do tablet no Android.
+        Abre a câmera LOCAL/NATIVA do tablet.
 
-        Correção aplicada:
-        - No Android, não cai mais para a câmera interna do Kivy/app.
-        - A câmera nativa grava em uma URI do MediaStore.
-        - Ao confirmar a foto, o app copia a imagem para a pasta privada do app.
-        - O PDF usa essa cópia privada, eliminando erro de permissão/anexagem.
+        Ajuste aplicado:
+        - No Android, o arquivo de destino fica na pasta externa específica do app
+          (/Android/data/<pacote>/files/ChecklistsFotosPdf), que a câmera nativa consegue
+          gravar e o PDF consegue ler depois.
+        - Primeiro tenta a câmera nativa via plyer, que é o caminho mais compatível no APK.
+        - Se o plyer falhar, tenta o Intent Android/MediaStore.
+        - Não bloqueia mais a abertura com a mensagem de "vai dar erro no PDF".
+        - A câmera interna do Kivy/app NÃO é aberta no Android.
         """
         garantir_permissao_camera_android()
         app = App.get_running_app()
         item = app.item_atual or {}
 
         try:
-            # Destino FINAL usado pelo PDF: pasta privada do app, sempre legível pelo Pillow.
-            pasta = pasta_fotos_privada_app(item)
+            # Pasta correta para câmera local do tablet + leitura posterior pelo PDF.
+            # Não usar Documents/Checklists e não usar user_data_dir interno para a câmera nativa.
+            pasta = pasta_fotos_camera_nativa_segura(item)
             arquivo = pasta / nome_foto_local(item)
             self._foto_pendente_path = str(arquivo)
             self._camera_output_path = str(arquivo)
@@ -1924,22 +1928,37 @@ class ChecklistScreen(BaseScreen):
             return
 
         if platform == "android":
+            erros = []
+
+            # 1) Caminho preferencial: câmera nativa/local via plyer.
+            if native_camera is not None:
+                try:
+                    native_camera.take_picture(
+                        filename=self._foto_pendente_path,
+                        on_complete=self._foto_nativa_concluida,
+                    )
+                    self.set_status("Câmera local do tablet aberta. Tire a foto e confirme para anexar ao PDF.")
+                    return
+                except Exception as e:
+                    erros.append(f"plyer: {e}")
+
+            # 2) Segundo caminho: Intent Android + MediaStore.
             try:
                 if self._abrir_camera_nativa_android(self._foto_pendente_path):
                     return
-                self.set_status(
-                    "Não foi possível abrir a câmera nativa do tablet. "
-                    "A câmera interna do app foi bloqueada de propósito para evitar erro no PDF."
-                )
-                return
+                erros.append(getattr(self, "_ultimo_erro_camera_nativa", "Intent Android/MediaStore falhou."))
             except Exception as exc:
-                self.set_status(
-                    "Erro ao abrir câmera nativa do tablet. "
-                    f"A câmera interna do app não será aberta. Detalhe: {exc}"
-                )
-                return
+                erros.append(f"Intent Android/MediaStore: {exc}")
 
-        # Somente fora do Android, mantém uma alternativa para teste em Windows/notebook.
+            self.set_status(
+                "Não foi possível abrir a câmera local do tablet. "
+                "A câmera interna do app não será aberta. "
+                "Verifique se o buildozer.spec contém plyer e a permissão CAMERA. "
+                f"Detalhe: {' | '.join(str(x) for x in erros if x)}"
+            )
+            return
+
+        # Fora do Android, mantém fallback para teste em notebook/Windows.
         if native_camera is not None:
             try:
                 native_camera.take_picture(
@@ -1951,7 +1970,6 @@ class ChecklistScreen(BaseScreen):
             except Exception as e:
                 self.set_status(f"Câmera nativa indisponível fora do Android. Detalhe: {e}")
 
-        # Fallback apenas para teste desktop, nunca no Android.
         self._abrir_camera_kivy_popup(item)
 
     def _foto_nativa_concluida(self, filename=None, *args):
@@ -2066,7 +2084,7 @@ class ChecklistScreen(BaseScreen):
                 activity.unbind(on_activity_result=self._on_camera_activity_result)
             except Exception:
                 pass
-            self.set_status(f"Falha ao abrir câmera nativa do tablet: {e}")
+            self._ultimo_erro_camera_nativa = f"Falha ao abrir câmera nativa do tablet: {e}"
             return False
 
     def _copiar_uri_android_para_arquivo(self, uri, destino_path):
@@ -2415,5 +2433,3 @@ class ChecklistRevisaoApp(App):
 
 if __name__ == "__main__":
     ChecklistRevisaoApp().run()
-
-
