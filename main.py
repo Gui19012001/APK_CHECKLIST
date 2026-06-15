@@ -4,6 +4,7 @@
 
 import os
 import json
+import re
 import time
 import threading
 import datetime
@@ -176,6 +177,16 @@ def status_emoji_para_texto(emoji):
     return {"✅": "Conforme", "❌": "Não Conforme", "🟡": "N/A"}.get(emoji, "")
 
 
+def validar_medicao_numerica(valor) -> bool:
+    """Aceita cota numérica digitada com vírgula ou ponto decimal."""
+    txt = normalizar_texto(valor)
+    if not txt:
+        return False
+    txt = txt.replace(",", ".")
+    txt = re.sub(r"\s+", "", txt)
+    return bool(re.fullmatch(r"\d+(?:\.\d+)?", txt))
+
+
 def garantir_permissao_camera_android():
     try:
         from android.permissions import request_permissions, Permission
@@ -246,6 +257,117 @@ def pasta_fotos_local(item_apontamento):
     pasta = base / tipo / serie
     pasta.mkdir(parents=True, exist_ok=True)
     return pasta
+
+
+def pasta_fotos_privada_app(item_apontamento):
+    """
+    Pasta interna do app para foto usada no PDF.
+
+    No Android, fotos tiradas pela camera nativa em /storage/emulated/0/Documents
+    podem ficar visiveis no explorador, mas bloqueadas para leitura pelo proprio app
+    na hora de montar o PDF. Esta pasta fica dentro do armazenamento do app e garante
+    que a imagem consiga ser reaberta pelo Pillow durante a geracao do PDF.
+    """
+    try:
+        app = App.get_running_app()
+        base = Path(getattr(app, "user_data_dir", str(BASE_DIR))) / "checklists_fotos_pdf"
+    except Exception:
+        base = BASE_DIR / "checklists_fotos_pdf"
+    tipo = _normaliza_codigo(item_apontamento.get("tipo_producao")).upper() or "NA"
+    serie = _normaliza_codigo(item_apontamento.get("numero_serie")) or "NA"
+    pasta = base / tipo / serie
+    pasta.mkdir(parents=True, exist_ok=True)
+    return pasta
+
+
+def pasta_fotos_camera_nativa_segura(item_apontamento):
+    """
+    Pasta segura para a câmera NATIVA do tablet salvar a foto.
+
+    A câmera do tablet precisa gravar em um local acessível para ela, mas o PDF
+    precisa conseguir reabrir a imagem depois. Por isso, no Android usamos a pasta
+    externa específica do próprio app:
+
+        /storage/emulated/0/Android/data/<pacote>/files/ChecklistsFotosPdf
+
+    Essa pasta evita o erro Permission denied visto quando a foto fica em
+    /storage/emulated/0/Documents/Checklists.
+    """
+    tipo = _normaliza_codigo(item_apontamento.get("tipo_producao")).upper() or "NA"
+    serie = _normaliza_codigo(item_apontamento.get("numero_serie")) or "NA"
+
+    if platform == "android":
+        try:
+            from android.storage import primary_external_storage_path
+            pacote = "org.kivy.checklist"
+            try:
+                from jnius import autoclass
+                PythonActivity = autoclass("org.kivy.android.PythonActivity")
+                pacote = str(PythonActivity.mActivity.getPackageName()) or pacote
+            except Exception:
+                pass
+
+            base = (
+                Path(primary_external_storage_path())
+                / "Android"
+                / "data"
+                / pacote
+                / "files"
+                / "ChecklistsFotosPdf"
+            )
+            pasta = base / tipo / serie
+            pasta.mkdir(parents=True, exist_ok=True)
+            return pasta
+        except Exception:
+            return pasta_fotos_privada_app(item_apontamento)
+
+    return pasta_fotos_local(item_apontamento)
+
+
+def _arquivo_liberado_para_leitura(caminho):
+    try:
+        caminho = Path(caminho)
+        if not caminho.exists() or caminho.stat().st_size <= 0:
+            return False
+        with caminho.open("rb") as f:
+            f.read(8)
+        return True
+    except Exception:
+        return False
+
+
+def salvar_foto_para_pdf(img, item_apontamento):
+    """
+    Salva a foto da camera interna do app em um local que o gerador de PDF consegue ler.
+    No Android, prioriza a pasta privada do app para eliminar erro Permission denied
+    na anexagem da imagem ao PDF.
+    """
+    nome = nome_foto_local(item_apontamento)
+    destinos = []
+
+    if platform == "android":
+        destinos.append(pasta_fotos_privada_app(item_apontamento))
+
+    destinos.append(pasta_fotos_local(item_apontamento))
+
+    ultimo_erro = None
+    usados = set()
+    for pasta in destinos:
+        try:
+            pasta = Path(pasta)
+            if str(pasta) in usados:
+                continue
+            usados.add(str(pasta))
+            pasta.mkdir(parents=True, exist_ok=True)
+            arquivo = pasta / nome
+            img.save(str(arquivo), format="JPEG", quality=95)
+            if _arquivo_liberado_para_leitura(arquivo):
+                return arquivo
+            ultimo_erro = RuntimeError(f"Arquivo salvo, mas sem permissao de leitura: {arquivo}")
+        except Exception as e:
+            ultimo_erro = e
+
+    raise RuntimeError(f"Nao foi possivel salvar uma foto legivel para o PDF. Detalhe: {ultimo_erro}")
 
 
 def nome_foto_local(item_apontamento):
@@ -694,24 +816,26 @@ PERGUNTAS_MANGA_PNM_BASE = [
     "Os cordões de solda do eixo estão conformes?",
     "As caixas estão corretas? Escreva qual o modelo:",
     "As porcas da bolsa dos suspensores estão devidamente assentadas e apertadas?",
-    "Etiqueta pede suspensor?",
-    "Etiqueta pede Sem Suporte da Bolsa (S/AP)?",
-    "Etiqueta pede Mão Francesa?",
+    "Etiqueta Téc. pede suspensor?",
+    "Etiqueta Téc. pede Suporte da Bolsa?",
+    "Etiqueta Téc. pede Mão Francesa?",
 ]
 ITEM_KEYS_MANGA_PNM = {
     1: "ETIQUETA", 2: "PLACA_IMETRO_E_NUMERO_SERIE", 3: "TESTE_ABS", 4: "RODAGEM",
     5: "GRAXEIRAS", 6: "SISTEMA_ATUACAO", 7: "CATRACA_FREIO", 8: "TAMPA_CUBO",
     9: "PINTURA_EIXO", 10: "SOLDA", 11: "CAIXAS", 12: "PORCAS",
-    13: "FALTA_SUSPENSOR", 14: "FALTA_SPT_BOLSA", 15: "FALTA_MAO_FRANCESA", 16: "GRAU_DIVERGENTE",
+    13: "FALTA_SUSPENSOR", 14: "FALTA_SPT_BOLSA", 15: "FALTA_MAO_FRANCESA",
+    16: "ENTRE_CENTRO_BRACOS", 17: "GRAU_DIVERGENTE",
 }
+ITEM_MANGA_ENTRE_CENTRO_BRACOS_IDX = 16
 OPCOES_MODELOS_MANGA_PNM = {
     4: ["", "Single", "Aço", "Alumínio", "N/A"],
     6: ["", "Spring", "Cuíca", "N/A"],
     7: ["", "Automático", "Manual", "N/A"],
     10: ["", "Conforme", "Respingo", "Falta de cordão", "Porosidade", "Falta de Fusão"],
 }
-ITENS_TEXTO_MANGA_PNM = {11, 15, 16}
-ITENS_SIM_NAO_MANGA_PNM = {12, 13, 14}
+ITENS_TEXTO_MANGA_PNM = {11, 17}
+ITENS_SIM_NAO_MANGA_PNM = {12, 13, 14, 15}
 
 PERGUNTAS_MOLA = [
     "Etiqueta do produto – As informações estão corretas / legíveis conforme modelo e gravação do eixo?",
@@ -724,7 +848,7 @@ PERGUNTAS_MOLA = [
     "Qual o comprimento do braço móvel utilizado?",
     "Os parafusos dos braços estão apertados?",
     "Porcas das bases laterais do Rack estão corretamente apertadas?",
-    "Tampa do cubo, pintura e graxeiras estão conforme?",
+    "Tampa do cubo, pintura e graxeiras estão conforme? As graxeiras estão em perfeito estado? Sem Avaria?",
 ]
 ITEM_KEYS_MOLA = {
     1: "ETIQUETA", 2: "PLACA_INMETRO", 3: "COR_DA_VIGA", 4: "GRAMPO", 5: "FEIXE_DE_MOLA",
@@ -789,6 +913,7 @@ def perguntas_por_tipo(tipo_producao):
         return list(PERGUNTAS_EIXO)
     perguntas = list(PERGUNTAS_MANGA_PNM_BASE)
     if tipo == "MANGA":
+        perguntas.append("A medida do entre centro dos braços estão conforme especificado na etiqueta? Informe:")
         perguntas.append("Grau do Manga conforme etiqueta do produto? Escreva qual o Grau:")
     return perguntas
 
@@ -1012,6 +1137,8 @@ def complemento_config(tipo_producao, idx):
         if idx in OPCOES_MODELOS_EIXO:
             return "spinner", OPCOES_MODELOS_EIXO[idx], "Selecione o modelo quando aplicável."
         return "", None, ""
+    if tipo == "MANGA" and idx == ITEM_MANGA_ENTRE_CENTRO_BRACOS_IDX:
+        return "numero", None, "Obrigatório: informe numericamente a cota encontrada."
     if idx in OPCOES_MODELOS_MANGA_PNM:
         return "spinner", OPCOES_MODELOS_MANGA_PNM[idx], "Selecione o modelo quando aplicável."
     if idx in ITENS_SIM_NAO_MANGA_PNM:
@@ -1090,12 +1217,10 @@ class StyledButton(Button):
 
 class StyledInput(TextInput):
     def __init__(self, hint="", navy=False, **kwargs):
-        # Correção importante para Android:
-        # A versão anterior escondia o texto real do TextInput e desenhava um
-        # "espelho" por cima. Em alguns teclados Android isso fazia os campos
-        # de complemento reaproveitarem/duplicarem textos digitados em outros
-        # itens. Agora o TextInput usa o texto nativo visível, mantendo o mesmo
-        # visual de borda/fundo, mas sem sobreposição de texto.
+        # Campos de complemento das perguntas precisam ficar com leitura forte no Android.
+        # Em alguns tablets o TextInput nativo ignora/clareia foreground_color.
+        # Por isso, para navy=False, escondemos o texto nativo e desenhamos uma camada
+        # preta por cima, mantendo o valor real em self.text para salvar no Supabase/PDF.
         kwargs.setdefault("input_type", "text")
         kwargs.setdefault("keyboard_suggestions", False)
         kwargs.setdefault("size_hint_y", None)
@@ -1103,15 +1228,21 @@ class StyledInput(TextInput):
         kwargs.setdefault("padding", [dp(14), dp(12), dp(14), dp(12)])
 
         self._navy = navy
+        self._mirror_enabled = not bool(navy)
         self._radius = 16
         self._texture = make_vertical_gradient_texture(FIELD_TOP, FIELD_BOTTOM)
+        self._display_pad_x = dp(14)
+
+        native_fg = TEXT_LIGHT if navy else (0, 0, 0, 0)
+        native_disabled_fg = (1, 1, 1, 0.85) if navy else (0, 0, 0, 0)
+        native_hint = (0.92, 0.96, 1, 1) if navy else (0, 0, 0, 0)
 
         super().__init__(
             multiline=False,
             hint_text=hint,
-            foreground_color=TEXT_LIGHT if navy else TEXT_DARK,
-            disabled_foreground_color=(1, 1, 1, 0.85) if navy else TEXT_MUTED,
-            hint_text_color=(0.92, 0.96, 1, 1) if navy else TEXT_MUTED,
+            foreground_color=native_fg,
+            disabled_foreground_color=native_disabled_fg,
+            hint_text_color=native_hint,
             cursor_color=(1, 1, 1, 1) if navy else (0, 0, 0, 1),
             selection_color=(1, 1, 1, 0.25) if navy else (0.2, 0.4, 0.8, 0.35),
             background_color=(0, 0, 0, 0),
@@ -1132,12 +1263,55 @@ class StyledInput(TextInput):
                 self._border_color = Color(*CARD_BORDER)
             self._border_line = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, self._radius), width=1.15)
 
+        if self._mirror_enabled:
+            with self.canvas.after:
+                self._mirror_color = Color(0, 0, 0, 1)
+                self._mirror_rect = RoundedRectangle(pos=self.pos, size=(0, 0), radius=[0, 0, 0, 0])
+            self.bind(text=self._update_mirror_text)
+            self.bind(hint_text=self._update_mirror_text)
+            self.bind(pos=self._update_mirror_text)
+            self.bind(size=self._update_mirror_text)
+            self.bind(focus=self._update_mirror_text)
+            self.bind(password=self._update_mirror_text)
+            Clock.schedule_once(self._update_mirror_text, 0)
+
         self.bind(pos=self._update_bg, size=self._update_bg)
+
+    def _mirror_value(self):
+        txt = self.text or ""
+        if txt:
+            if getattr(self, "password", False):
+                return "*" * len(txt), (0, 0, 0, 1)
+            return txt, (0, 0, 0, 1)
+        # Placeholder também em preto para não ficar apagado no tablet.
+        return self.hint_text or "", (0, 0, 0, 1)
+
+    def _update_mirror_text(self, *_):
+        if not getattr(self, "_mirror_enabled", False):
+            return
+        try:
+            txt, color = self._mirror_value()
+            self._mirror_color.rgba = color
+            if not txt:
+                self._mirror_rect.texture = None
+                self._mirror_rect.size = (0, 0)
+                return
+
+            label = CoreLabel(text=txt, font_size=self.font_size, color=color)
+            label.refresh()
+            texture = label.texture
+            self._mirror_rect.texture = texture
+            self._mirror_rect.pos = (self.x + self._display_pad_x, self.center_y - texture.height / 2)
+            self._mirror_rect.size = texture.size
+        except Exception:
+            pass
 
     def _update_bg(self, *_):
         self._fill_rect.pos = self.pos
         self._fill_rect.size = self.size
         self._border_line.rounded_rectangle = (self.x, self.y, self.width, self.height, self._radius)
+        if getattr(self, "_mirror_enabled", False):
+            self._update_mirror_text()
 
 
 class LoginStyledInput(StyledInput):
@@ -1310,6 +1484,16 @@ class QuestionCard(Card):
         elif tipo_widget == "texto":
             hint = "Informe valor / tipo / dimensão" if self.tipo_producao == "MOLA" else "Complemento"
             self.complement_widget = StyledInput(hint, size_hint_y=None, height=dp(42), navy=False)
+            row.add_widget(self.complement_widget)
+        elif tipo_widget == "numero":
+            self.complement_widget = StyledInput(
+                "Informe cota medida",
+                input_type="number",
+                keyboard_suggestions=False,
+                size_hint_y=None,
+                height=dp(42),
+                navy=False,
+            )
             row.add_widget(self.complement_widget)
         else:
             row.add_widget(Label())
@@ -1691,9 +1875,9 @@ class ChecklistScreen(BaseScreen):
         foto_card = Card(orientation="vertical", padding=dp(12), spacing=dp(8), size_hint_y=None, height=dp(134), bg=CARD_BG, border=CARD_BORDER)
         foto_card.add_widget(Label(text="Foto do checklist - vista superior do produto", color=TEXT_DARK, bold=True, halign="left", valign="middle", size_hint_y=None, height=dp(28)))
         foto_row = BoxLayout(orientation="horizontal", spacing=dp(10), size_hint_y=None, height=dp(52))
-        btn_foto = StyledButton("Abrir câmera / Tirar foto", primary=True, size_hint_x=0.42)
+        btn_foto = StyledButton("Abrir câmera do tablet", primary=True, size_hint_x=0.42)
         btn_foto.bind(on_release=lambda *_: self.abrir_camera())
-        self.lbl_foto = Label(text="Nenhuma foto salva ainda. A foto será gravada em uma pasta local pelo número de série.", color=TEXT_MUTED, halign="left", valign="middle", size_hint_x=0.58)
+        self.lbl_foto = Label(text="Nenhuma foto anexada ainda. A foto será feita pela câmera nativa do tablet e anexada ao PDF.", color=TEXT_MUTED, halign="left", valign="middle", size_hint_x=0.58)
         self.lbl_foto.bind(size=lambda inst, val: setattr(inst, "text_size", val))
         foto_row.add_widget(btn_foto)
         foto_row.add_widget(self.lbl_foto)
@@ -1724,14 +1908,25 @@ class ChecklistScreen(BaseScreen):
         item = app.item_atual or {}
 
         try:
-            pasta = pasta_fotos_local(item)
+            # PADRAO CORRETO: câmera NATIVA do tablet.
+            # A foto é direcionada para uma pasta segura do app, evitando Permission denied no PDF.
+            pasta = pasta_fotos_camera_nativa_segura(item)
             arquivo = pasta / nome_foto_local(item)
             self._foto_pendente_path = str(arquivo)
         except Exception as e:
             self.set_status(f"Erro ao preparar pasta da foto: {e}")
             return
 
-        # 1) Preferência no APK: câmera nativa via Plyer.
+        # Por padrão usa a câmera local/nativa do tablet.
+        # Só use CHECKLIST_CAMERA_MODE=APP se quiser forçar a câmera interna Kivy para teste.
+        modo_camera = os.getenv("CHECKLIST_CAMERA_MODE", "NATIVE").strip().upper()
+        if modo_camera in {"APP", "KIVY", "INTERNA"}:
+            if Camera is not None:
+                self._abrir_camera_kivy_popup(item)
+                return
+            self.set_status("Camera interna do app indisponivel. Tentando camera nativa do tablet.")
+
+        # Uso opcional da camera nativa via Plyer.
         # Para funcionar, manter no buildozer.spec: requirements = ...,plyer,...
         if native_camera is not None:
             try:
@@ -1739,21 +1934,21 @@ class ChecklistScreen(BaseScreen):
                     filename=self._foto_pendente_path,
                     on_complete=self._foto_nativa_concluida,
                 )
-                self.set_status("Câmera nativa aberta. Tire a foto e confirme no app da câmera.")
+                self.set_status("Camera nativa aberta. Tire a foto e confirme no app da camera.")
                 return
             except Exception as e:
                 # Continua para tentativa por Intent manual / fallback Kivy.
-                self.set_status(f"Câmera nativa via Plyer falhou. Tentando alternativa. Detalhe: {e}")
+                self.set_status(f"Camera nativa via Plyer falhou. Tentando alternativa. Detalhe: {e}")
 
-        # 2) Android sem Plyer: tenta Intent nativa manual.
+        # Android sem Plyer: tenta Intent nativa manual.
         if platform == "android":
             try:
                 if self._abrir_camera_nativa_android(self._foto_pendente_path):
                     return
             except Exception as e:
-                self.set_status(f"Câmera nativa Android falhou. Abrindo câmera interna. Detalhe: {e}")
+                self.set_status(f"Camera nativa Android falhou. Abrindo camera interna. Detalhe: {e}")
 
-        # 3) Fallback desktop/seguro: câmera interna Kivy.
+        # Fallback desktop/seguro: camera interna Kivy.
         self._abrir_camera_kivy_popup(item)
 
     def _foto_nativa_concluida(self, filename=None, *args):
@@ -1777,10 +1972,17 @@ class ChecklistScreen(BaseScreen):
             # Não bloqueia o fluxo se a normalização falhar.
             pass
 
+        if not _arquivo_liberado_para_leitura(arquivo):
+            self.set_status(
+                "Foto feita pela camera nativa, mas o Android bloqueou a leitura para anexar no PDF. "
+                "Feche e tente novamente; a foto deve ser salva na pasta segura do app."
+            )
+            return
+
         self.foto_local_path = str(arquivo)
         if self.lbl_foto:
-            self.lbl_foto.text = f"Foto salva localmente\n{arquivo}"
-        self.set_status(f"Foto salva com câmera nativa: {arquivo.name}")
+            self.lbl_foto.text = f"Foto anexada ao PDF\n{arquivo}"
+        self.set_status(f"Foto salva com camera nativa: {arquivo.name}")
 
     def _normalizar_foto_pos_camera(self, arquivo):
         """Aplica orientação EXIF da câmera nativa sem reduzir qualidade perceptível."""
@@ -1939,9 +2141,6 @@ class ChecklistScreen(BaseScreen):
 
         def capturar(*_):
             try:
-                pasta = pasta_fotos_local(item)
-                arquivo = pasta / nome_foto_local(item)
-
                 texture = camera.texture
                 if texture is None:
                     raise RuntimeError("Câmera ainda não carregou a imagem. Aguarde 1 segundo e tente novamente.")
@@ -1961,13 +2160,13 @@ class ChecklistScreen(BaseScreen):
                 if img.mode != "RGB":
                     img = img.convert("RGB")
 
-                img.save(str(arquivo), format="JPEG", quality=95)
+                arquivo = salvar_foto_para_pdf(img, item)
 
                 camera.play = False
                 self.foto_local_path = str(arquivo)
                 if self.lbl_foto:
-                    self.lbl_foto.text = f"Foto salva localmente\n{arquivo}"
-                self.set_status(f"Foto salva no tablet: {arquivo.name}")
+                    self.lbl_foto.text = f"Foto anexada ao PDF\n{arquivo}"
+                self.set_status(f"Foto salva pela camera do app: {arquivo.name}")
                 popup.dismiss()
             except Exception as e:
                 self.set_status(f"Erro ao salvar foto local: {e}")
@@ -1999,6 +2198,11 @@ class ChecklistScreen(BaseScreen):
         if is_eixo(tipo):
             complementos["RASTREIO_ESQ"] = normalizar_texto(self.rastreio_esq_input.text if self.rastreio_esq_input else "")
             complementos["RASTREIO_DIR"] = normalizar_texto(self.rastreio_dir_input.text if self.rastreio_dir_input else "")
+        if tipo == "MANGA":
+            medida_entre_centro = normalizar_texto(complementos.get(ITEM_MANGA_ENTRE_CENTRO_BRACOS_IDX, ""))
+            if not validar_medicao_numerica(medida_entre_centro):
+                self.set_status("⚠️ Informe numericamente a cota do entre centro dos braços do MANGA.")
+                return
         if tipo == "MOLA":
             faltam_obs = [idx for idx in ITENS_OBS_OBRIGATORIA_MOLA if not normalizar_texto(complementos.get(idx, ""))]
             if faltam_obs:
@@ -2114,4 +2318,5 @@ class ChecklistRevisaoApp(App):
 
 if __name__ == "__main__":
     ChecklistRevisaoApp().run()
+
 
