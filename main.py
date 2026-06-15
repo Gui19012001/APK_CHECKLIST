@@ -1900,55 +1900,58 @@ class ChecklistScreen(BaseScreen):
 
     def abrir_camera(self):
         """
-        Abre a câmera NATIVA do Android para evitar perda de qualidade e problemas de preview girado.
-        Fallback: se estiver rodando no Windows ou se a câmera nativa falhar, abre a câmera interna do Kivy.
+        Abre SEMPRE a câmera NATIVA/LOCAL do tablet no Android.
+
+        Correção aplicada:
+        - No Android, não cai mais para a câmera interna do Kivy/app.
+        - A câmera nativa grava em uma URI do MediaStore.
+        - Ao confirmar a foto, o app copia a imagem para a pasta privada do app.
+        - O PDF usa essa cópia privada, eliminando erro de permissão/anexagem.
         """
         garantir_permissao_camera_android()
         app = App.get_running_app()
         item = app.item_atual or {}
 
         try:
-            # PADRAO CORRETO: câmera NATIVA do tablet.
-            # A foto é direcionada para uma pasta segura do app, evitando Permission denied no PDF.
-            pasta = pasta_fotos_camera_nativa_segura(item)
+            # Destino FINAL usado pelo PDF: pasta privada do app, sempre legível pelo Pillow.
+            pasta = pasta_fotos_privada_app(item)
             arquivo = pasta / nome_foto_local(item)
             self._foto_pendente_path = str(arquivo)
+            self._camera_output_path = str(arquivo)
+            self._camera_content_uri = None
         except Exception as e:
             self.set_status(f"Erro ao preparar pasta da foto: {e}")
             return
 
-        # Por padrão usa a câmera local/nativa do tablet.
-        # Só use CHECKLIST_CAMERA_MODE=APP se quiser forçar a câmera interna Kivy para teste.
-        modo_camera = os.getenv("CHECKLIST_CAMERA_MODE", "NATIVE").strip().upper()
-        if modo_camera in {"APP", "KIVY", "INTERNA"}:
-            if Camera is not None:
-                self._abrir_camera_kivy_popup(item)
+        if platform == "android":
+            try:
+                if self._abrir_camera_nativa_android(self._foto_pendente_path):
+                    return
+                self.set_status(
+                    "Não foi possível abrir a câmera nativa do tablet. "
+                    "A câmera interna do app foi bloqueada de propósito para evitar erro no PDF."
+                )
                 return
-            self.set_status("Camera interna do app indisponivel. Tentando camera nativa do tablet.")
+            except Exception as exc:
+                self.set_status(
+                    "Erro ao abrir câmera nativa do tablet. "
+                    f"A câmera interna do app não será aberta. Detalhe: {exc}"
+                )
+                return
 
-        # Uso opcional da camera nativa via Plyer.
-        # Para funcionar, manter no buildozer.spec: requirements = ...,plyer,...
+        # Somente fora do Android, mantém uma alternativa para teste em Windows/notebook.
         if native_camera is not None:
             try:
                 native_camera.take_picture(
                     filename=self._foto_pendente_path,
                     on_complete=self._foto_nativa_concluida,
                 )
-                self.set_status("Camera nativa aberta. Tire a foto e confirme no app da camera.")
+                self.set_status("Câmera nativa aberta. Tire a foto e confirme.")
                 return
             except Exception as e:
-                # Continua para tentativa por Intent manual / fallback Kivy.
-                self.set_status(f"Camera nativa via Plyer falhou. Tentando alternativa. Detalhe: {e}")
+                self.set_status(f"Câmera nativa indisponível fora do Android. Detalhe: {e}")
 
-        # Android sem Plyer: tenta Intent nativa manual.
-        if platform == "android":
-            try:
-                if self._abrir_camera_nativa_android(self._foto_pendente_path):
-                    return
-            except Exception as e:
-                self.set_status(f"Camera nativa Android falhou. Abrindo camera interna. Detalhe: {e}")
-
-        # Fallback desktop/seguro: camera interna Kivy.
+        # Fallback apenas para teste desktop, nunca no Android.
         self._abrir_camera_kivy_popup(item)
 
     def _foto_nativa_concluida(self, filename=None, *args):
@@ -1956,14 +1959,16 @@ class ChecklistScreen(BaseScreen):
         Clock.schedule_once(lambda dt: self._finalizar_foto_nativa(filename), 0)
 
     def _finalizar_foto_nativa(self, filename=None):
-        caminho = _normaliza_codigo(filename) or self._foto_pendente_path
+        caminho = _normaliza_codigo(filename) or getattr(self, "_camera_output_path", "") or self._foto_pendente_path
         if caminho.startswith("content://"):
-            # Alguns providers retornam URI; nesse caso o arquivo planejado costuma ser o válido.
-            caminho = self._foto_pendente_path
+            caminho = getattr(self, "_camera_output_path", "") or self._foto_pendente_path
 
         arquivo = Path(caminho)
         if not arquivo.exists() or arquivo.stat().st_size <= 0:
-            self.set_status("Foto não foi salva. Abra a câmera novamente e confirme a captura.")
+            self.set_status(
+                "Foto não foi anexada. A câmera abriu, mas o arquivo final não foi gerado. "
+                "Tire a foto novamente e confirme no app da câmera."
+            )
             return
 
         try:
@@ -1974,15 +1979,15 @@ class ChecklistScreen(BaseScreen):
 
         if not _arquivo_liberado_para_leitura(arquivo):
             self.set_status(
-                "Foto feita pela camera nativa, mas o Android bloqueou a leitura para anexar no PDF. "
-                "Feche e tente novamente; a foto deve ser salva na pasta segura do app."
+                "Foto salva, mas o app não conseguiu liberar a leitura para o PDF. "
+                "Tire a foto novamente; ela precisa ficar na pasta privada do app."
             )
             return
 
         self.foto_local_path = str(arquivo)
         if self.lbl_foto:
             self.lbl_foto.text = f"Foto anexada ao PDF\n{arquivo}"
-        self.set_status(f"Foto salva com camera nativa: {arquivo.name}")
+        self.set_status(f"Foto anexada ao PDF pela câmera nativa do tablet: {arquivo.name}")
 
     def _normalizar_foto_pos_camera(self, arquivo):
         """Aplica orientação EXIF da câmera nativa sem reduzir qualidade perceptível."""
@@ -1992,14 +1997,17 @@ class ChecklistScreen(BaseScreen):
             img = ImageOps.exif_transpose(img)
             if img.mode not in ("RGB", "L"):
                 img = img.convert("RGB")
-            # Mantém qualidade alta. Para PNG/JPG, Pillow escolhe pelo formato informado.
             img.save(str(arquivo), quality=95)
         except Exception:
             raise
 
     def _abrir_camera_nativa_android(self, arquivo_path):
         """
-        Fallback nativo por Intent. O Plyer é preferível, mas este caminho ajuda em builds sem Plyer.
+        Abre a câmera LOCAL/NATIVA do Android usando MediaStore.
+
+        Não usa a câmera do Kivy. A imagem é capturada em uma URI pública temporária
+        da câmera e depois copiada para `arquivo_path`, que fica na pasta privada do app
+        e pode ser anexada no PDF sem Permission denied.
         """
         try:
             from jnius import autoclass
@@ -2008,23 +2016,39 @@ class ChecklistScreen(BaseScreen):
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
             Intent = autoclass("android.content.Intent")
             MediaStore = autoclass("android.provider.MediaStore")
-            Uri = autoclass("android.net.Uri")
-            File = autoclass("java.io.File")
+            ContentValues = autoclass("android.content.ContentValues")
+            BuildVersion = autoclass("android.os.Build$VERSION")
+
+            ctx = PythonActivity.mActivity
+            resolver = ctx.getContentResolver()
+
+            destino = Path(arquivo_path)
+            destino.parent.mkdir(parents=True, exist_ok=True)
+
+            display_name = destino.name
+            values = ContentValues()
+            values.put(MediaStore.Images.Media.DISPLAY_NAME, display_name)
+            values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
 
             try:
-                StrictMode = autoclass("android.os.StrictMode")
-                StrictMode.disableDeathOnFileUriExposure()
+                if int(BuildVersion.SDK_INT) >= 29:
+                    values.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Checklists")
+                    values.put(MediaStore.Images.Media.IS_PENDING, 1)
             except Exception:
                 pass
 
-            arquivo = File(arquivo_path)
-            parent = arquivo.getParentFile()
-            if parent is not None and not parent.exists():
-                parent.mkdirs()
+            uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            if uri is None:
+                raise RuntimeError("MediaStore não retornou URI para a câmera salvar a foto.")
 
-            uri = Uri.fromFile(arquivo)
+            self._camera_content_uri = uri
+            self._camera_output_path = str(destino)
+            self._foto_pendente_path = str(destino)
+
             intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
             intent.putExtra(MediaStore.EXTRA_OUTPUT, uri)
+            intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
 
             self._camera_request_code = 7813
             try:
@@ -2033,16 +2057,71 @@ class ChecklistScreen(BaseScreen):
                 pass
             activity.bind(on_activity_result=self._on_camera_activity_result)
 
-            PythonActivity.mActivity.startActivityForResult(intent, self._camera_request_code)
-            self.set_status("Câmera nativa aberta. Tire a foto e confirme.")
+            ctx.startActivityForResult(intent, self._camera_request_code)
+            self.set_status("Câmera local do tablet aberta. Tire a foto e confirme para anexar ao PDF.")
             return True
-        except Exception:
+        except Exception as e:
             try:
                 from android import activity
                 activity.unbind(on_activity_result=self._on_camera_activity_result)
             except Exception:
                 pass
+            self.set_status(f"Falha ao abrir câmera nativa do tablet: {e}")
             return False
+
+    def _copiar_uri_android_para_arquivo(self, uri, destino_path):
+        """Copia a foto capturada via MediaStore para a pasta privada do app."""
+        from jnius import autoclass, jarray
+
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        FileOutputStream = autoclass("java.io.FileOutputStream")
+
+        destino = Path(destino_path)
+        destino.parent.mkdir(parents=True, exist_ok=True)
+
+        resolver = PythonActivity.mActivity.getContentResolver()
+        entrada = resolver.openInputStream(uri)
+        if entrada is None:
+            raise RuntimeError("Não foi possível abrir a imagem retornada pela câmera.")
+
+        saida = FileOutputStream(str(destino))
+        buffer = jarray("b")([0] * 8192)
+        try:
+            while True:
+                n = entrada.read(buffer)
+                if n is None or int(n) <= 0:
+                    break
+                saida.write(buffer, 0, int(n))
+            saida.flush()
+        finally:
+            try:
+                entrada.close()
+            except Exception:
+                pass
+            try:
+                saida.close()
+            except Exception:
+                pass
+
+        if not destino.exists() or destino.stat().st_size <= 0:
+            raise RuntimeError("A câmera retornou imagem vazia; nada foi copiado para o PDF.")
+
+        return str(destino)
+
+    def _liberar_uri_camera_android(self, uri):
+        """Remove IS_PENDING no Android 10+ para finalizar a imagem no MediaStore."""
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            ContentValues = autoclass("android.content.ContentValues")
+            MediaStore = autoclass("android.provider.MediaStore")
+            BuildVersion = autoclass("android.os.Build$VERSION")
+            if int(BuildVersion.SDK_INT) >= 29:
+                values = ContentValues()
+                values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                PythonActivity.mActivity.getContentResolver().update(uri, values, None, None)
+        except Exception:
+            pass
 
     def _on_camera_activity_result(self, request_code, result_code, intent):
         try:
@@ -2057,8 +2136,26 @@ class ChecklistScreen(BaseScreen):
         except Exception:
             pass
 
-        # RESULT_OK normalmente é -1, mas se o arquivo existir, aceitamos mesmo assim.
-        Clock.schedule_once(lambda dt: self._finalizar_foto_nativa(self._foto_pendente_path), 0)
+        def finalizar_resultado(_dt):
+            uri = getattr(self, "_camera_content_uri", None)
+            destino = getattr(self, "_camera_output_path", "") or self._foto_pendente_path
+
+            try:
+                # RESULT_OK normalmente é -1. Mesmo assim, se existir URI, tentamos copiar.
+                if uri is not None:
+                    self._liberar_uri_camera_android(uri)
+                    self._copiar_uri_android_para_arquivo(uri, destino)
+                    self._finalizar_foto_nativa(destino)
+                    return
+
+                self._finalizar_foto_nativa(destino)
+            except Exception as exc:
+                self.set_status(
+                    "A foto foi tirada, mas não foi possível anexar ao PDF. "
+                    f"Detalhe: {exc}"
+                )
+
+        Clock.schedule_once(finalizar_resultado, 0)
 
     def _abrir_camera_kivy_popup(self, item):
         """
