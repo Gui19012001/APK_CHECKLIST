@@ -1930,19 +1930,12 @@ class ChecklistScreen(BaseScreen):
         if platform == "android":
             erros = []
 
-            # 1) Caminho preferencial: câmera nativa/local via plyer.
-            if native_camera is not None:
-                try:
-                    native_camera.take_picture(
-                        filename=self._foto_pendente_path,
-                        on_complete=self._foto_nativa_concluida,
-                    )
-                    self.set_status("Câmera local do tablet aberta. Tire a foto e confirme para anexar ao PDF.")
-                    return
-                except Exception as e:
-                    erros.append(f"plyer: {e}")
-
-            # 2) Segundo caminho: Intent Android + MediaStore.
+            # IMPORTANTE:
+            # Não usar plyer.take_picture no Android neste APK.
+            # Em alguns tablets/versões do Android o plyer abre a câmera nativa passando
+            # um file:// para outro app, gerando o erro:
+            # android.os.StrictMode$FileUriExposedException / onFileUriExposed.
+            # Por isso, no Android usamos SOMENTE Intent + MediaStore, que gera content://.
             try:
                 if self._abrir_camera_nativa_android(self._foto_pendente_path):
                     return
@@ -1953,7 +1946,8 @@ class ChecklistScreen(BaseScreen):
             self.set_status(
                 "Não foi possível abrir a câmera local do tablet. "
                 "A câmera interna do app não será aberta. "
-                "Verifique se o buildozer.spec contém plyer e a permissão CAMERA. "
+                "Ajuste aplicado: Android agora usa somente MediaStore/content:// para evitar FileUriExposed. "
+                "Verifique a permissão CAMERA no buildozer.spec. "
                 f"Detalhe: {' | '.join(str(x) for x in erros if x)}"
             )
             return
@@ -2039,6 +2033,14 @@ class ChecklistScreen(BaseScreen):
 
             ctx = PythonActivity.mActivity
             resolver = ctx.getContentResolver()
+
+            # Segurança extra: não usamos file://, mas em alguns ambientes uma biblioteca
+            # do sistema pode tentar endurecer a política. A câmera abaixo recebe content://.
+            try:
+                StrictMode = autoclass("android.os.StrictMode")
+                StrictMode.disableDeathOnFileUriExposure()
+            except Exception:
+                pass
 
             destino = Path(arquivo_path)
             destino.parent.mkdir(parents=True, exist_ok=True)
